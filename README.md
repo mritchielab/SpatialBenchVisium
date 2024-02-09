@@ -8,7 +8,8 @@ L. Rogers, Diana S. Hansen, Rory Bowden, and Matthew E. Ritchie
 
 *Link to paper*
 
-![Visium data generation and analysis workflow](https://github.com/mritchielab/SpatialBench/blob/main/Visium%20workflow.png)
+![Visium data generation and analysis workflow](https://github.com/mritchielab/SpatialBench/blob/main/Visium%20workflow.png) 
+Figure created with [BioRender](https://biorender.com).
 
 
 
