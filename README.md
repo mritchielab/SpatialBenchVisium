@@ -30,7 +30,11 @@ scRNA-seq: sc_preprocessing.Rmd
 ### Downstream analysis
 
 FFPE CA multi-sample: FFPE_CA_multi-sample.Rmd
-Changqing DE
+Pseudo-bulk differential expression analysis: as [targets](https://docs.ropensci.org/targets/) project under the `targets_project` folder
+
+#### Running targets
+
+Before running the targets project, you will need to replace the `targets_project/data/SpaceRanger` symlink with the appropriate path to the SpaceRanger output folder, and update the `targets_project/data/sample_ids.tsv` file's folder field. 
 
 ### Figures
 
@@ -40,6 +44,6 @@ Figure 2: compile script
 
 Figure 3: compile script
 
-Figure 4: compile script
+Figure 4 & 5, Supplementary figures S8-S11: run `targets::tar_make()` in the `targets_project` folder, figures are saved to `targets_project/output`
 
 Supplementary figures: compile script

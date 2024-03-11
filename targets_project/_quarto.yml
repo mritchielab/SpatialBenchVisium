@@ -1,0 +1,17 @@
+project:
+  title: "Visium samples"
+  execute-dir: project
+author: "Changqing"
+format:
+  html:
+    toc: true
+    embed-resources: true
+    anchor-sections: true
+    smooth-scroll: true
+    code-fold: true
+    code-tools: true
+    df-print: kable
+    fig-width: 12
+    fig-height: 9
+execute:
+  cache: false #lazyLoadDBinsertVariable(): long vectors not supported yet
