@@ -1,6 +1,6 @@
 This repository contains code used to perform analysis and figures featured in our paper:
 
-[**Spotlight on 10x Visium: a multi-sample protocol comparison of spatial technologiesh**](https://www.biorxiv.org/content/10.1101/2024.03.13.584910v1) 
+[**Spotlight on 10x Visium: a multi-sample protocol comparison of spatial technologies**](https://www.biorxiv.org/content/10.1101/2024.03.13.584910v1) 
 
 Mei R. M. Du, Changqing Wang, Charity W. Law, Daniela Amann-Zalcenstein, Casey J. A. Anttila, Ling Ling,
 Peter F. Hickey, Callum J. Sargeant, Yunshun Chen, Lisa J. Ioannidis, Pradeep Rajasekhar, Raymond Yip, Kelly
