@@ -2,11 +2,11 @@
 
 This repository contains code used to perform analysis and figures featured in our paper:
 
-**Comparing 10x Visium spatial transcriptomic technologies with SpatialBench** Mei R. M. Du, Changqing Wang, Charity W. Law, Daniela Amann-Zalcenstein, Casey J. A. Anttila, Ling Ling,
-Callum J. Sargeant, Peter F. Hickey, Yunshun Chen, Lisa J. Ioannidis, Pradeep Rajasekhar, Raymond Yip, Kelly
-L. Rogers, Diana S. Hansen, Rory Bowden, and Matthew E. Ritchie
+[**Comparing 10x Visium spatial transcriptomic technologies with SpatialBench**](https://www.biorxiv.org/content/10.1101/2024.03.13.584910v1) 
 
-*Link to paper*
+Mei R. M. Du, Changqing Wang, Charity W. Law, Daniela Amann-Zalcenstein, Casey J. A. Anttila, Ling Ling,
+Peter F. Hickey, Callum J. Sargeant, Yunshun Chen, Lisa J. Ioannidis, Pradeep Rajasekhar, Raymond Yip, Kelly
+L. Rogers, Diana S. Hansen, Rory Bowden, and Matthew E. Ritchie
 
 ![Visium data generation and analysis workflow](https://github.com/mritchielab/SpatialBench/blob/main/Visium%20workflow.png) 
 Figure created with [BioRender](https://biorender.com).
