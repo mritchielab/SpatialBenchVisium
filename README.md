@@ -18,16 +18,24 @@ Please cite our paper if you use our data and/or scripts in your studies.
 
 ## Index
 
-Download analysis folder and open index.html to view scripts as a website.
+Download the `site` folder and open `index.html` to view HTML reports as a website. Code to produce the reports are stored as Rmarkdown documents in `analysis`. Plots and objects are saved in `output`.
 
-### Quality control
+### Pre-processing
 
-Spatial (example samples): EDA_709_FFPE_CA.Rmd, EDA_713_FFPE_CA.Rmd
-scRNA-seq: sc_preprocessing.Rmd
+#### Spatial
+Sample 709 FFPE CA: `analysis/EDA_709_FFPE_CA.Rmd`
+
+Sample 713 FFPE CA: `analysis/EDA_713_FFPE_CA.Rmd`
+
+#### scRNA-seq
+`analysis/sc_preprocessing.Rmd`
 
 ### Downstream analysis
 
-FFPE CA multi-sample: FFPE_CA_multi-sample.Rmd
+Multi-sample feature selection, clustering, cell type deconvolution: `analysis/FFPE_CA_multi-sample.Rmd`
+
+Annotation and results: `analysis/annotation.Rmd`
+
 Pseudo-bulk differential expression analysis: as [targets](https://docs.ropensci.org/targets/) project under the `targets_project` folder
 
 #### Running targets
@@ -36,12 +44,6 @@ Before running the targets project, you will need to replace the `targets_projec
 
 ### Figures
 
-Figure 1c-e: figures.R
-
-Figure 2: compile script
-
-Figure 3: compile script
+Figures 1-3, Supplementary figures S2-S7: `analysis/figures.R`
 
 Figure 4 & 5, Supplementary figures S8-S11: run `targets::tar_make()` in the `targets_project` folder, figures are saved to `targets_project/output`
-
-Supplementary figures: compile script
