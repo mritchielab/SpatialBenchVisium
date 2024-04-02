@@ -34,8 +34,6 @@ Sample 713 FFPE CA: `analysis/EDA_713_FFPE_CA.Rmd`
 
 Multi-sample feature selection, clustering, cell type deconvolution: `analysis/FFPE_CA_multi-sample.Rmd`
 
-Annotation and results: `analysis/annotation.Rmd`
-
 Pseudo-bulk differential expression analysis: as [targets](https://docs.ropensci.org/targets/) project under the `targets_project` folder
 
 #### Running targets
