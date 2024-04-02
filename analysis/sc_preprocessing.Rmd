@@ -1,0 +1,1507 @@
+---
+title: "scRNA-seq data preprocessing"
+author:
+  - name: Mei Du
+date: "`r Sys.Date()`"
+output: 
+  distill::distill_article:
+    toc: true
+    toc_float: true
+    code_folding: true
+editor_options:
+  chunk_output_type: console
+---
+
+# Background
+
+- Initial sequencing run of the 3 mouse spleens (708, 709, 713): 10x scRNA-seq with the large BioLegend panel of antibody derived tags (ADTs) 
+
+- 708 = Mouse_HTO_11, 709 = Mouse_HTO_12, 713 = Mouse_HTO_13
+
+- Pete has run the data through Cell Ranger and also performed demultiplexing of the hashtag oligo (HTO) data using [demuxmix](https://bioconductor.org/packages/demuxmix/).
+
+- The dataset then needs to be pre-processed for downstream analysis, to then use it to integrate with the spatial data for cell type deconvolution. This analysis follows the [**OSCA workflow**](http://bioconductor.org/books/3.13/OSCA) and a previous analysis.
+
+# Load data
+
+```{r setup}
+library(here)
+library(biomaRt)
+library(Seurat)
+library(scater)
+library(scran)
+library(cowplot)
+library(pheatmap)
+library(Glimma)
+```
+
+```{r panelset, echo=FALSE, include=FALSE}
+xaringanExtra::use_panelset()
+```
+
+4,776 out of 23,402 droplets are multiplet or negative.
+
+```{r}
+sce <- readRDS("/stornext/Projects/score/Analyses/G000218_spatial_benchmarking_study/data/SCEs/G000218_spleen_708_709_713.demultiplexed.SCE.rds")
+summary(colData(sce)$HTO_demuxmix)
+```
+
+```{r experiment-by-sample, fig.cap = "Breakdown of the samples."}
+p1 <- ggcells(sce, exprs_values = "counts") + 
+    geom_bar(aes(x = HTO_demuxmix, fill = sce$demuxmix$HTO),
+      position = position_fill(reverse = TRUE)) +
+    coord_flip() +
+    ylab("Frequency") +
+    theme_cowplot(font_size = 8) + 
+    scale_fill_brewer(palette="Set1")
+p2 <- ggcells(sce, exprs_values = "counts") +
+    geom_bar(aes(x = HTO_demuxmix, fill = HTO_demuxmix)) +
+    coord_flip() +
+    ylab("Number of droplets") +
+    theme_cowplot(font_size = 8) +
+    scale_fill_brewer(palette="Set2")
+p1 + p2
+```
+
+## Gene annotation
+
+Getting chromosome names and ENSEMBL gene IDs.
+
+```{r, echo=FALSE}
+# get chromosome names
+mart <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+chr <- biomaRt::select(mart, keys=rowData(sce)$ID, keytype="ensembl_gene_id",columns=c("ensembl_gene_id","chromosome_name"))
+rowData(sce)[rowData(sce)$ID %in% chr$ensembl_gene_id,"Chr"] <- chr$chromosome_name
+
+# make gene symbols rownames
+rownames(sce) <- rowData(sce)$Symbol
+```
+
+# Quality control
+
+Using `scater`'s quality control metrics function and identifying mitochondrial and ribosomal protein genes.
+
+```{r}
+mito_set <- rownames(sce)[which(rowData(sce)$Chr %in% c("MT","Mt"))]
+ribo_set <- grep("^Rp(l|s)|RP", rownames(sce), value = TRUE)
+
+is_mito <- rownames(sce) %in% mito_set
+summary(is_mito)
+is_ribo <- rownames(sce) %in% ribo_set
+summary(is_ribo)
+df <- perCellQCMetrics(sce, subsets=list(Mito=is_mito))
+summary(df$sum)
+summary(df$detected)
+sce <- addPerCellQCMetrics(sce, subsets=list(Mito=is_mito))
+colnames(colData(sce))
+```
+
+## Identifying low-quality cells
+
+Trying an adaptive threshold approach, identifying cells that are outliers based on the median absolute deviation (MAD) from the median value of each metric across all cells, rather than arbitrarily setting custom thresholds. "By default, we consider a value to be an outlier if it is more than 3 MADs from the median in the “problematic” direction. This is loosely motivated by the fact that such a filter will retain 99% of non-outlier values that follow a normal distribution." There is an assumption here that most of the dataset is of high quality.
+
+```{r}
+reasons <- perCellQCFilters(df, sub.fields = "subsets_Mito_percent")
+colSums(as.matrix(reasons))
+summary(reasons$discard)
+
+# extract filter thresholds
+attr(reasons$low_lib_size, "thresholds")
+attr(reasons$low_n_features, "thresholds")
+```
+
+## Diagnostic plots
+
+```{r, fig.height=8}
+colData(sce) <- cbind(colData(sce), df)
+
+sce$discard <- reasons$discard
+gridExtra::grid.arrange(
+    plotColData(sce, x="HTO_demuxmix", y="sum", colour_by="discard",
+        other_fields="HTO_demuxmix") +
+        scale_y_log10() + ggtitle("Total count"),
+    plotColData(sce, x="HTO_demuxmix", y="detected", colour_by="discard", 
+         other_fields="HTO_demuxmix") +
+        scale_y_log10() + ggtitle("Detected features"),
+    plotColData(sce, x="HTO_demuxmix", y="subsets_Mito_percent", colour_by="discard",
+                other_fields="HTO_demuxmix") + ggtitle("Mito percent"),
+    plotColData(sce, x="HTO_demuxmix", y="altexps_HTO_percent", colour_by="discard",
+                other_fields="HTO_demuxmix") + ggtitle("HTO percent"),
+    ncol=1
+)
+```
+
+It is also valuable to examine how the other QC metrics behave with respect to each other (Figure 3). Generally, they will be in rough agreement, i.e. cells with low total counts will also have low numbers of expressed features and mitochondrial proportions. Clear discrepancies may correspond to technical differences between batches of cells or genuine biological differences in RNA content. 
+
+```{r, fig.cap="Behaviour of each QC metric compared to the total number of expressed features. Each point represents a cell in the dataset."}
+gridExtra::grid.arrange(
+  plotColData(sce, x="detected",y="sum",colour_by="discard") + 
+    xlab("Number of expressed genes") + 
+    ylab("Library size"), 
+  plotColData(sce, x="sum",y="subsets_Mito_percent",colour_by="discard") +
+    xlab("Library size") + 
+    ylab("Mitochondrial proportion (%)"), ncol=2)
+```
+
+## Removing low-quality cells
+
+A sce.filtered SCE is created by subsetting, excluding the "discarded" cells. 
+
+Note: These cells could also be marked and retained in the downstream analysis to allow clustering which can be then ignored when interpreting results. This could avoid losing potential biologically meaningful information, but compromises the accuracy of variance modelling.
+
+For the time being, we opt to retain the ‘labelled’ doublets identified during the demultiplexing of the hashtag and genotype data (the demultiplexing will not identify all doublets, most obviously those formed between cells from the same sample). Instead, by retaining these ‘labelled’ doublets we can use ‘guilt by association’ to identify neighbouring ‘unlabelled’ doublets, avoiding problems with small residual clusters comprised solely of intra-sample doublets.
+
+Similarly, we opt to retain ‘negative’ droplets because these may allow us to identify a subpopulation of cells that are not captured by hashing. For completeness, we also retain the ‘unassigned’ droplets even though these are unlikely to correspond to a subpopulation(s) related to biology and are more likely to reflect a subpopulation of cells with low sequencing coverage.
+
+```{r}
+sce.filtered <- sce[,!reasons$discard]
+```
+
+## Checking for removal of biologically relevant subpopulations
+
+We can diagnose cell type loss by looking for systematic differences in gene expression between the discarded and retained cells. If the discarded pool is enriched for a certain cell type, we should observe increased expression of the corresponding marker genes.
+
+```{r}
+lost <- calculateAverage(counts(sce)[, reasons$discard])
+kept <- calculateAverage(counts(sce.filtered))
+
+logged <- edgeR::cpm(cbind(lost, kept), log = TRUE, prior.count = 2)
+logFC <- logged[, 1] - logged[, 2]
+abundance <- rowMeans(logged)
+
+is_mito <- rownames(sce) %in% mito_set
+is_ribo <- rownames(sce) %in% ribo_set
+```
+
+The systematically upregulated genes are mitochondrial transcripts (blue) and that those systematically downregulated genes are largely ribosomal protein genes (orange). This suggests that the QC step did not inadvertently filter out an entire biologically relevant subpopulation.
+
+```{r, fig.cap="Log-fold change in expression in the discarded cells compared to the retained cells. Each point represents a gene with mitochondrial transcripts in blue and ribosomal protein genes in orange. Dashed red lines indicate |logFC|=1"}
+par(mfrow = c(1, 1))
+plot(
+  abundance,
+  logFC,
+  xlab = "Average count",
+  ylab = "Log-FC (lost/kept)",
+  pch = 16)
+points(
+  abundance[is_mito],
+  logFC[is_mito],
+  col = "dodgerblue",
+  pch = 16,
+  cex = 1)
+points(
+  abundance[is_ribo],
+  logFC[is_ribo],
+  col = "orange",
+  pch = 16,
+  cex = 1)
+abline(h = c(-1, 1), col = "red", lty = 2)
+```
+
+```{r, fig.cap="Droplets removed during QC, stratified by HTO."}
+ggcells(sce) +
+  geom_bar(aes(x = HTO_demuxmix, fill=!reasons$discard)) +
+  ylab("Number of droplets") +
+  theme_cowplot(font_size = 9) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Normalisation by deconvolution
+
+```{r,eval=FALSE}
+set.seed(100)
+clust <- quickCluster(sce.filtered) 
+#table(clust)
+
+sce.filtered <- computeSumFactors(sce.filtered, cluster=clust, min.mean=0.1)
+summary(sizeFactors(sce.filtered))
+#saveRDS(sce.filtered, here("analysis","sce.filtered.norm.RDS"))
+```
+
+```{r, include=FALSE}
+sce.filtered <- readRDS(here("analysis","output","RDS","sce.filtered.norm.RDS"))
+summary(sizeFactors(sce.filtered))
+```
+
+We check that the size factors are roughly aligned with the total library sizes. Deviations from the diagonal correspond to composition biases due to differential expression between cell sub-populations.
+
+```{r, fig.cap="Size factors from deconvolution, plotted against library sizes for all cells in each dataset. Axes are shown on a log-scale.", echo=FALSE}
+xlim <- c(0.1, max(sce.filtered$sum) / 1e3)
+ylim <- range(sizeFactors(sce.filtered))
+par(mfrow = c(2, 3))
+lapply(levels(sce.filtered$HTO_demuxmix), function(s) {
+  sce <- sce.filtered[, sce.filtered$HTO_demuxmix == s]
+  plot(
+    x = sce$sum / 1e3,
+    y = sizeFactors(sce),
+    log = "xy",
+    xlab = "Library size (thousands)",
+    ylab = "Size factor",
+    xlim = xlim,
+    ylim = ylim,
+    main = s,
+    pch = 16,
+    cex = 0.5)
+})
+```
+
+## Scaling and log-transforming
+
+```{r}
+sce.filtered <- logNormCounts(sce.filtered)
+assayNames(sce.filtered)
+```
+
+# Feature selection
+
+Trend fitting and variance decomposition separately for each batch to focus on genes that are highly variable within each batch. To account for the mean-variance relationship, we fit a trend to the variance under the assumption of Poisson variation.
+
+## Quantifying variation
+
+```{r}
+dec.block <- modelGeneVar(sce.filtered, block=sce.filtered$HTO_demuxmix) # want to use modelGeneVarByPoisson but error - might be log(0 or -inf)
+head(dec.block[order(dec.block$bio, decreasing=TRUE),1:6])
+```
+
+```{r, fig.cap="Variance in the dataset as a function of the mean after blocking on the sample of origin. Each plot represents the results for a single sample, each point represents a gene (black) and the blue line represents the trend fitted to all genes.", warning=FALSE}
+
+blocked.stats <- dec.block$per.block
+par(mfrow = c(2, 3))
+for (i in colnames(blocked.stats)[1:5]) {
+    current <- blocked.stats[[i]]
+    plot(current$mean, current$total, main=i, pch=16, cex=0.5,
+        xlab="Mean of log-expression", ylab="Variance of log-expression")
+    curfit <- metadata(current)
+    points(curfit$mean, curfit$var, col="black", pch=16)
+    curve(curfit$trend(x), col='dodgerblue', add=TRUE, lwd=2)
+}
+```
+
+This figure visualises the quality of the batch-specific trend fits and highlights the need for batch-specific estimates of these fits. The analysis of each batch yields estimates of the biological and technical components for each gene, which are averaged across batches.
+
+## Selecting HVGs
+
+The next step is to select the subset of HVGs to use in downstream analyses. A larger subset will reduce the risk of discarding interesting biological signal by retaining more potentially relevant genes, at the cost of increasing noise from irrelevant genes that might obscure said signal. It is difficult to determine the optimal trade-off for any given application as noise in one context may be useful signal in another. 
+
+We select the top 10% of genes with the highest biological components.
+
+```{r}
+hvgs <- getTopHVGs(dec.block, prop=0.1) # 1295 genes
+head(hvgs)
+# write.csv(dec.block[hvgs,], here("analysis","output","HVGs","sce_hvgs.csv"))
+
+is_mito <- hvgs %in% mito_set
+is_ribo <- hvgs %in% ribo_set
+```
+
+```{r, fig.cap="Percentage of top-K HVGs that are either mitochondrial or ribosomal protein genes."}
+par(mfrow = c(1, 1))
+plot(
+  100 * cumsum(is_mito) / seq_along(hvgs),
+  log = "x",
+  ylim = c(0, 100),
+  ylab = "%",
+  xlab = "Top-k genes",
+  col = "dodgerblue",
+  pch = 16)
+points(100 * cumsum(is_ribo) / seq_along(hvgs), col = "orange", pch = 16)
+points(
+  100 * cumsum(is_mito | is_ribo) / seq_along(hvgs),
+  col = "black",
+  pch = 16)
+legend(
+  "topright",
+  pch = 16,
+  col = c("black", "orange", "dodgerblue"),
+  legend = c("Both", "Ribosomal protein", "Mitochondrial"))
+```
+
+```{r,eval=FALSE,include=FALSE, fig.cap="Violin plots of normalised log-expression values for the top 10 HVGs. Each point represents such value in a single cell."}
+plotExpression(object = sce.filtered, features = hvgs[1:10])
+```
+
+# Dimensionality reduction
+
+Using `denoisePCA` or the elbow method gives 5 PCs as the best number of PCs to capture the greatest amount of variation, but that may be too few, so we try 10 PCs with `fixedPCA`. We do not use the default number of 50 PCs, to aid during clustering (number of clusters & computation time).
+
+```{r, fig.cap="Percentage of variance explained by 50 successive PCs, shown on a log-scale for visualisation purposes."}
+sce.filtered <- fixedPCA(sce.filtered,subset.row=hvgs)
+percent.var <- attr(reducedDim(sce.filtered), "percentVar")
+elbow <- PCAtools::findElbowPoint(percent.var)
+elbow
+plot(percent.var, log="y", xlab="PC", ylab="Variance explained (%)")
+abline(v=elbow,col="red")
+```
+
+```{r}
+set.seed(101)
+# keep original SCE but specify HVGs to use downstream
+sce.filtered <- fixedPCA(sce.filtered, rank=10, subset.row=hvgs)
+reducedDimNames(sce.filtered)
+dim(reducedDim(sce.filtered, "PCA"))
+```
+
+```{r, fig.cap="PCA plot of the first 2 PCs."}
+plotReducedDim(sce.filtered, dimred="PCA", colour_by="HTO_demuxmix")
+```
+
+```{r}
+set.seed(102)
+sce.filtered <- runUMAP(sce.filtered, dimred="PCA")
+umap_df <- makePerCellDF(sce.filtered)
+bg <- dplyr::select(umap_df, -HTO_demuxmix)
+ggplot(aes(x = UMAP.1, y = UMAP.2), data = umap_df) +
+  geom_point(data = bg, colour = scales::alpha("grey", 0.5), size = 0.125) +
+  geom_point(aes(colour = HTO_demuxmix), alpha = 1, size = 0.25) +
+  theme_cowplot(font_size = 10) +
+  xlab("Dimension 1") +
+  ylab("Dimension 2") +
+  facet_wrap(. ~ HTO_demuxmix, ncol = 3)
+# saveRDS(sce.filtered,here("analysis","output","RDS","sce.filtered.RDS"))
+```
+
+# Clustering
+
+scRNA-seq datasets generated with 10X will include droplets that are not relevant to the study, even after the initial quality control, which we don’t want to include in downstream analyses. In this section we aim to filter out these ‘unwanted’ droplets and retain only those droplets containing ‘biologically relevant’ cells. Examples of unwanted droplets include:
+
+* Droplets containing stripped nuclei
+* Droplets containing more than one cell (‘doublets’)
+* Droplets without phenotype data, such as droplets for which we can’t infer the sample identify based on cell hashing or genetic variation data
+
+Once we are confident that we have selected the biologically relevant cells, we will perform data integration (if necessary) and a further round of clustering in preparation for downstream analysis.
+
+The removal of unwanted droplets is an iterative process where at each step we:
+
+1. Identify cluster(s) enriched for unwanted droplets. The exact criteria used to define ‘unwanted’ will depend on the type of droplets we are trying to identify at each step.
+  + Perform diagnostic checks to ensure we aren’t discarding biologically relevant droplets.
+  + Remove the unwanted cells.
+  
+2. Re-process the remaining droplets.
+  + Identify HVGs
+  + Perform dimensionality reduction (PCA and UMAP).
+  + Cluster droplets.
+
+By default, `clusterCells()` uses the 10 nearest neighbors of each cell to construct a shared nearest neighbor graph. Two cells are connected by an edge if any of their nearest neighbors are shared, with the edge weight defined from the highest average rank of the shared neighbors (Xu and Su 2015). The Louvain method from the `igraph` package is then used to identify communities. The Walktrap method outlined in OSCA was far too slow.
+
+```{r, include=FALSE}
+sce.filtered <- readRDS(here("analysis","output","RDS","sce.filtered.RDS"))
+```
+
+```{r}
+set.seed(1004)
+clusters.nn <- clusterCells(sce.filtered, use.dimred="PCA",BLUSPARAM=bluster::SNNGraphParam(k=50,cluster.fun="louvain"))
+table(clusters.nn)
+colLabels(sce.filtered) <- clusters.nn
+# saveRDS(sce.filtered, here("analysis","output","RDS","sce.filtered.clust.RDS")) 
+```
+
+```{r, include=FALSE}
+sce.filtered <- readRDS(here("analysis","output","RDS","sce.filtered.clust.RDS"))
+```
+
+```{r, fig.cap="UMAP plot, where each point represents a droplet and is coloured according to the legend.",layout="l-body-outset", fig.width=6}
+plotUMAP(sce.filtered,colour_by="label", text_by="label") + plotUMAP(sce.filtered,colour_by="HTO_demuxmix")
+```
+
+```{r, fig.cap="Breakdown of clusters by experimental factors.",layout="l-body-outset", fig.width=6}
+p1 <- ggcells(sce.filtered) +
+  geom_bar(
+    aes(x = label, fill = HTO_demuxmix),
+    position = position_fill(reverse = TRUE)) +
+  coord_flip() +
+  xlab("Cluster") +
+  ylab("Frequency") +
+  theme_cowplot(font_size = 6) +
+  scale_fill_brewer(palette="Set2")
+p2 <- ggcells(sce.filtered) +
+  geom_bar(aes(x = label, fill = label)) +
+  coord_flip() +
+  xlab("Cluster") +
+  ylab("Number of droplets") +
+  theme_cowplot(font_size = 6) +
+  ggthemes::scale_fill_tableau(palette="Tableau 20", direction=-1)
+p3 <- ggcells(sce.filtered) +
+  geom_bar(aes(x = label, fill = sce.filtered$demuxmix$HTO),position = position_fill(reverse = TRUE)) +
+  coord_flip() +
+  xlab("Cluster") +
+  ylab("Frequency") +
+  theme_cowplot(font_size = 6) +
+  scale_fill_brewer(palette="Set1")
+p1+p2+p3
+```
+
+* Cluster 2 is highly enriched for multiplets
+
+* No clusters appear to be enriched for negative/unassigned droplets. 
+
+## Multiplets
+
+We can identify HTO-derived multiplets (droplets with combinations of Mouse_HTO_1*) and genotype-derived multiplets (droplets labelled as multiplets), "labelled" droplets. A limitation is that multiplets with the same HTO/from the same sample are not detected. To avoid this, we recover the remaining intra-sample doublets based on their similarity with "known" doublets in gene expression space, i.e. "guilt by association".
+
+```{r}
+prop_genotype_multiplet <- tapply(
+  sce.filtered$HTO_demuxmix == "multiplet",
+  sce.filtered$label,
+  function(x) sum(x) / length(x))
+sort(prop_genotype_multiplet)
+prop_genotype_multiplet_outliers <- isOutlier(
+  prop_genotype_multiplet,
+  type = "higher",
+  # NOTE: Only want clusters that are **way** out there.
+  nmads = 5)
+genotype_multiplet_enriched_clusters <- levels(sce.filtered$label)[
+  prop_genotype_multiplet_outliers]
+
+prop_hto_multiplet <- tapply(
+  sce.filtered$demuxmix$HTO %in% c("Mouse_HTO_11,Mouse_HTO_12,Mouse_HTO_13", "Mouse_HTO_11,Mouse_HTO_12","Mouse_HTO_11,Mouse_HTO_13","Mouse_HTO_12,Mouse_HTO_13"), # Logical vector of which are HTO doublets
+  sce.filtered$label, # Which cluster they belong to
+  function(x) sum(x) / length(x)) # For each cluster work out proportion doublets
+sort(prop_hto_multiplet)
+prop_hto_multiplet_outliers <- isOutlier(
+  prop_hto_multiplet,
+  type = "higher",
+  nmads = 3)
+hto_multiplet_enriched_clusters <- levels(sce.filtered$label)[
+  prop_hto_multiplet_outliers]
+
+prop_labelled_multiplet <- tapply(
+  sce.filtered$HTO_demuxmix == "multiplet" | sce.filtered$demuxmix$HTO %in% c("Mouse_HTO_11,Mouse_HTO_12,Mouse_HTO_13", "Mouse_HTO_11,Mouse_HTO_12","Mouse_HTO_11,Mouse_HTO_13","Mouse_HTO_12,Mouse_HTO_13"),
+  sce.filtered$label,
+  function(x) sum(x) / length(x))
+sort(prop_labelled_multiplet)
+prop_labelled_multiplet_outliers <- isOutlier(
+  prop_labelled_multiplet,
+  type = "higher",
+  # NOTE: Only want clusters that are **way** out there.
+  nmads = 5)
+labelled_multiplet_enriched_clusters <- levels(sce.filtered$label)[
+  prop_labelled_multiplet_outliers]
+
+multiplet_enriched_clusters <- "2"
+data.frame(genotype_multiplet_enriched_clusters, hto_multiplet_enriched_clusters,labelled_multiplet_enriched_clusters,multiplet_enriched_clusters)
+```
+
+For each droplet, we calculate the proportion of its nearest neighbours that are "labelled" droplets. Intra-sample doublets should have high values for this metric under the assumption that their gene expression profiles are similar to inter-sample doublets involving the same combination of cell states/types.
+
+```{r}
+# NOTE: This is a kludge to estimate the relative frequency of each 
+#       (labelled singlet) sample.
+tmp <- colData(sce.filtered)
+tmp <- tmp[tmp$HTO_demuxmix %in% c("708","709","713"), ]
+tmp <- droplevels(tmp)
+sample_freq <- table(tmp$HTO_demuxmix)
+
+library(scDblFinder)
+doublets_df <- recoverDoublets(
+  sce.filtered,
+  doublets = sce.filtered$HTO_demuxmix == "multiplet" | sce.filtered$demuxmix$HTO %in% c("Mouse_HTO_11,Mouse_HTO_12,Mouse_HTO_13", "Mouse_HTO_11,Mouse_HTO_12","Mouse_HTO_11,Mouse_HTO_13","Mouse_HTO_12,Mouse_HTO_13"),
+  use.dimred = "PCA",
+  samples = sample_freq)
+```
+
+```{r, fig.cap="UMAP plot, where each point is a cell and is colored by the whether or not it is a ‘labelled’ doublet (left), by the proportion of neighbouring droplets that are ‘labelled’ droplets (centre), and whether or not it is a predicted ‘unlabelled’ doublet (right)."}
+umap_df <- makePerCellDF(sce.filtered)
+umap_df$known_doublet_proportion <- doublets_df$proportion
+umap_df$known_doublet <- doublets_df$known
+umap_df$predicted_doublet <- doublets_df$predicted
+
+plot_grid(
+  ggplot(aes(x = UMAP.1, y = UMAP.2), data = umap_df) +
+    geom_point(
+      aes(
+        colour = known_doublet,
+        alpha = known_doublet,
+        size = known_doublet)) +
+    scale_colour_manual(values = c("FALSE" = "grey", "TRUE" = "red")) +
+    scale_alpha_manual(values = c("FALSE" = 0.25, "TRUE" = 1)) +
+    scale_size_manual(values = c("FALSE" = 0.125, "TRUE" = 0.25)) +
+    theme_cowplot(font_size = 8) +
+    xlab("Dimension 1") +
+    ylab("Dimension 2") +
+    guides(colour = "none", size = "none", alpha = "none") +
+    ggtitle("Known doublets"),
+  ggplot(aes(x = UMAP.1, y = UMAP.2), data = umap_df) +
+    geom_point(aes(colour = known_doublet_proportion), size = 0.125) +
+    theme_cowplot(font_size = 8) +
+    xlab("Dimension 1") +
+    ylab("Dimension 2") +
+    scale_colour_viridis_c(guide = guide_colorbar("")) +
+    ggtitle("Doublet proportions") +
+    theme(legend.position = c(0.75, 0.3)),
+  ggplot(aes(x = UMAP.1, y = UMAP.2), data = umap_df) +
+    geom_point(
+      aes(
+        colour = predicted_doublet,
+        alpha = predicted_doublet,
+        size = predicted_doublet)) +
+    scale_colour_manual(values = c("FALSE" = "grey", "TRUE" = "royalblue")) +
+    scale_alpha_manual(values = c("FALSE" = 0.25, "TRUE" = 1)) +
+    scale_size_manual(values = c("FALSE" = 0.125, "TRUE" = 0.25)) +
+    theme_cowplot(font_size = 8) +
+    xlab("Dimension 1") +
+    ylab("Dimension 2") +
+    guides(colour = "none", size = "none", alpha = "none") +
+    ggtitle("Predicted doublets"),
+  align = "v",
+  ncol = 3)
+```
+
+Sample 708 has a relatively higher proportion of unlabelled/predicted multiplets. There are also a few predicted multiplets in the "negative" group.
+
+```{r}
+library(tidyverse)
+library(janitor)
+data.frame(
+  Sample = sce.filtered$HTO_demuxmix,
+  singlet = doublets_df$predicted|doublets_df$known,
+  known_doublet = doublets_df$known,
+  predicted_doublet = doublets_df$predicted) %>%
+  group_by(sce.filtered$HTO_demuxmix) %>%
+  summarise(
+    `Singlet` = sum(singlet == FALSE),
+    `Known multiplet` = sum(known_doublet),
+    `Predicted multiplet` = sum(predicted_doublet)) %>%
+  adorn_totals(c("row", "col")) %>%
+  adorn_percentages("row") %>%
+  adorn_pct_formatting() %>%
+  adorn_ns() %>%
+  knitr::kable(caption = "Number of known 'labelled' doublets and predicted 'unlabelled' doublets that were labelled as coming from each `Sample`. Percentages are with respect to the total number of droplets from each `Sample`.")
+```
+
+### Checking for removal of biologically relevant subpopulations
+
+We propose to remove the droplets in the multiplet-enriched cluster 2. Notably, this will exclude ‘unlabelled’ doublets in this cluster on the basis that these droplets are transcriptomically very similar to these ‘labelled’ doublets. We are not yet removing the ‘known’ doublets outside of these clusters. 
+
+We check for cell type loss by looking for systematic differences in gene expression between the discarded and retained cells.
+
+```{r}
+keep <- !sce.filtered$label %in% multiplet_enriched_clusters
+lost <- calculateAverage(counts(sce.filtered)[, !keep])
+kept <- calculateAverage(counts(sce.filtered)[, keep])
+
+logged <- edgeR::cpm(cbind(lost, kept), log = TRUE, prior.count = 2)
+logFC <- logged[, 1] - logged[, 2]
+abundance <- rowMeans(logged)
+```
+
+There are some genes with a large negative logFC between "lost" and "kept" droplets. These appear to be immune genes that have lower expression in the "lost" droplets.
+
+```{r, fig.cap="Log-fold change in expression in the discarded cells compared to the retained cells. Each point represents a gene with mitochondrial transcripts in blue and ribosomal protein genes in orange. Dashed red lines indicate |logFC|=1."}
+is_mito <- rownames(sce.filtered) %in% mito_set
+is_ribo <- rownames(sce.filtered) %in% ribo_set
+
+plot(
+  abundance,
+  logFC,
+  xlab = "Average count",
+  ylab = "Log-FC (lost/kept)",
+  pch = 16)
+points(
+  abundance[is_mito],
+  logFC[is_mito],
+  col = "dodgerblue",
+  pch = 16,
+  cex = 1)
+points(
+  abundance[is_ribo],
+  logFC[is_ribo],
+  col = "orange",
+  pch = 16,
+  cex = 1)
+abline(h = c(-1, 1), col = "red", lty = 2)
+```
+
+```{r}
+glMDPlot(
+  x = data.frame(abundance = abundance, logFC = logFC),
+  xval = "abundance",
+  yval = "logFC",
+  counts = cbind(lost, kept),
+    anno = cbind(
+      as.data.frame(rowData(sce.filtered)),
+      data.frame(GeneID = rownames(sce.filtered), stringsAsFactors = FALSE)),
+  display.columns = c("Symbol", "ID", "Chr"),
+  groups = factor(c("lost", "kept")),
+  samples = c("lost", "kept"),
+  status = unname(ifelse(is_mito, 1, ifelse(is_ribo, -1, 0))),
+  transform = FALSE,
+  main = "lost vs. kept",
+  side.ylab = "Average count",
+  cols = c("orange", "black", "dodgerblue"),
+  launch = TRUE)
+```
+ 
+The increased immune gene expression in these droplets could indicate that there were a high proportion of immune-like doublets removed. More likely, however, is that these are doublets comprised of an immune-like cell and a non-immune-like cell. To further investigate this, we identify the two potential ‘source’ clusters that could give rise to the multiplet cluster.
+
+The below figures shows the marker genes for the multiplet cluster. We see that every gene detected in this cluster is also expressed in either of the two proposed source clusters. We therefore conclude that these clusters are indeed largely comprised of doublets from two distinct cell types.
+
+```{r,fig.cap="Heatmaps of mean-centered and normalized log-expression values for the top set of markers for the doublet-enriched clusters. Column colours represent the cluster to which each cell is assigned, as indicated by the legend. The title of each panel names the cluster in question followed by the two putative ‘source’ clusters in parentheses."}
+dbl_out <- findDoubletClusters(sce.filtered, sce.filtered$label)
+markers <- findMarkers(sce.filtered, sce.filtered$label, direction = "up")
+
+heatmaps <- list()
+for (cluster in multiplet_enriched_clusters) {
+  dbl_markers <- markers[[cluster]]
+  chosen <- rownames(dbl_markers)[dbl_markers$Top <= 5]
+  title <- paste0(
+    cluster,
+    " (",
+    dbl_out[cluster, "source1"],
+    ", ",
+    dbl_out[cluster, "source2"],
+    ")")
+  heatmaps[[cluster]] <- plotHeatmap(
+    sce.filtered,
+    order_columns_by = "label",
+    features = chosen,
+    center = TRUE,
+    zlim = c(-5, 5),
+    color = hcl.colors(101, "Blue-Red 3"),
+    main = title,
+    silent = TRUE,
+    fontsize = 5)
+}
+gridExtra::grid.arrange(heatmaps[[1]][["gtable"]])
+```
+
+Most of the proposed removed droplets are ‘labelled’ doublets, as we expect from the above analysis.
+
+```{r,fig.cap="Droplets removed after excluding ‘labelled’ and ‘unlabelled’ predicted doublets, stratified by HTO_demuxmix."}
+ggcells(sce.filtered) +
+  geom_bar(aes(x = HTO_demuxmix, fill = keep)) +
+  ylab("Number of droplets") +
+  theme_cowplot(font_size = 9) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Summary
+
+We opt to remove the droplets in the multiplet-enriched cluster 2. This removes 2,362 droplets, retaining 23,926 droplets for further analysis. The dataset may still contain some ‘unlabelled’ doublets, but their number should be very small owing to the experimental design.
+
+```{r}
+sce.clust <- sce.filtered[, keep]
+colData(sce.clust) <- droplevels(colData(sce.clust))
+summary(colData(sce.clust)$HTO_demuxmix)
+```
+
+## Re-processing
+
+```{r}
+dec.block <- modelGeneVar(sce.clust, block=sce.clust$HTO_demuxmix)
+hvgs <- getTopHVGs(dec.block, var.threshold = 0)
+hvgs <- setdiff(hvgs, union(ribo_set, mito_set))
+hvgs <- head(hvgs, 5000) # using 5000 HVGs to get more structure for identification of labelled singlets
+
+set.seed(101)
+sce.clust.2 <- fixedPCA(sce.clust,subset.row=hvgs)
+
+set.seed(102)
+sce.clust.2 <- runUMAP(sce.clust.2, dimred="PCA")
+
+set.seed(1004)
+clusters.nn <- clusterCells(sce.clust.2, use.dimred="PCA",BLUSPARAM=bluster::SNNGraphParam(k=50,cluster.fun="louvain"))
+table(clusters.nn)
+colLabels(sce.clust.2) <- clusters.nn
+#saveRDS(sce.clust.2, here("analysis","output","RDS","sce.filtered.clust.2.RDS"))
+```
+
+```{r,include=FALSE}
+sce.clust.2 <- readRDS(here("analysis","output","RDS","sce.filtered.clust.2.RDS"))
+```
+
+```{r, fig.cap="UMAP plot, where each point represents a droplet and is coloured according to the legend.",layout="l-body-outset", fig.width=6}
+plotUMAP(sce.clust.2,colour_by="label", text_by="label") + plotUMAP(sce.clust.2,colour_by="HTO_demuxmix")
+```
+
+```{r, fig.cap="Breakdown of clusters by experimental factors.",layout="l-body-outset", fig.width=6}
+p1 <- ggcells(sce.clust.2) +
+  geom_bar(
+    aes(x = label, fill = HTO_demuxmix),
+    position = position_fill(reverse = TRUE)) +
+  coord_flip() +
+  xlab("Cluster") +
+  ylab("Frequency") +
+  theme_cowplot(font_size = 6) +
+  scale_fill_brewer(palette="Set2")
+p2 <- ggcells(sce.clust.2) +
+  geom_bar(aes(x = label, fill = label)) +
+  coord_flip() +
+  xlab("Cluster") +
+  ylab("Number of droplets") +
+  theme_cowplot(font_size = 6) +
+  ggthemes::scale_fill_tableau(palette="Tableau 20", direction=-1)
+p3 <- ggcells(sce.clust.2) +
+  geom_bar(aes(x = label, fill = sce.clust.2$demuxmix$HTO),position = position_fill(reverse = TRUE)) +
+  coord_flip() +
+  xlab("Cluster") +
+  ylab("Frequency") +
+  theme_cowplot(font_size = 6) +
+  scale_fill_brewer(palette="Set1")
+p1+p2+p3
+```
+
+There are still multiplet and negative droplets but they are not highly enriched in any particular cluster(s).
+
+## Selection of "labelled" singlets
+
+Since there are no clusters enriched for unassigned droplets, there is no cluster-level analysis to be performed. Instead, we simply remove the droplets labelled as unassigned. We also take the opportunity to remove the remaining doublet droplets, as these are not useful in downstream analyses.
+
+### Checking for removal of biologically relevant subpopulations
+We again check for cell type loss by looking for systematic differences in gene expression between the discarded and retained cells.
+
+```{r}
+keep <- sce.clust.2$HTO_demuxmix != "negative" & sce.clust.2$HTO_demuxmix != "multiplet"
+lost <- calculateAverage(counts(sce.clust.2)[, !keep])
+kept <- calculateAverage(counts(sce.clust.2)[, keep])
+
+logged <- edgeR::cpm(cbind(lost, kept), log = TRUE, prior.count = 2)
+logFC <- logged[, 1] - logged[, 2]
+abundance <- rowMeans(logged)
+```
+
+If the discarded pool is enriched for a certain cell type, we should observe increased expression of the corresponding marker genes. The below shows the result of this analysis, highlighting that there are a few genes with a large logFC between ‘lost’ and "kept" droplets. These genes are also immune/immunoglobulin genes, and are upregulated in the "kept" droplets.
+
+```{r, fig.cap="Log-fold change in expression in the discarded cells compared to the retained cells. Each point represents a gene with mitochondrial transcripts in blue and ribosomal protein genes in orange. Dashed red lines indicate |logFC|=1."}
+is_mito <- rownames(sce.clust.2) %in% mito_set
+is_ribo <- rownames(sce.clust.2) %in% ribo_set
+
+plot(
+  abundance,
+  logFC,
+  xlab = "Average count",
+  ylab = "Log-FC (lost/kept)",
+  pch = 16)
+points(
+  abundance[is_mito],
+  logFC[is_mito],
+  col = "dodgerblue",
+  pch = 16,
+  cex = 1)
+points(
+  abundance[is_ribo],
+  logFC[is_ribo],
+  col = "orange",
+  pch = 16,
+  cex = 1)
+abline(h = c(-1, 1), col = "red", lty = 2)
+```
+
+```{r,eval=FALSE}
+glMDPlot(
+  x = data.frame(abundance = abundance, logFC = logFC),
+  xval = "abundance",
+  yval = "logFC",
+  counts = cbind(lost, kept),
+    anno = cbind(
+      as.data.frame(rowData(sce.clust.2)),
+      data.frame(GeneID = rownames(sce.clust.2), stringsAsFactors = FALSE)),
+  display.columns = c("Symbol", "ID", "Chr"),
+  groups = factor(c("lost", "kept")),
+  samples = c("lost", "kept"),
+  status = unname(ifelse(is_mito, 1, ifelse(is_ribo, -1, 0))),
+  transform = FALSE,
+  main = "lost vs. kept",
+  side.ylab = "Average count",
+  cols = c("orange","black", "dodgerblue"))
+```
+
+As expected, all droplets to be removed are multiplet or negative droplets.
+
+```{r}
+ggcells(sce.clust.2) +
+  geom_bar(aes(x = HTO_demuxmix, fill = keep)) +
+  ylab("Number of droplets") +
+  theme_cowplot(font_size = 9) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Summary
+
+We conclude that it is unlikely that our genetic labeling has systematically under-labelled a biologically relevant cell type.
+
+The unassigned and doublet droplets are not useful in downstream analyses, so we removed them from the data.
+
+This removes 2,304 droplets, retaining 21,693 droplets for further analysis.
+
+```{r}
+sce.clust.2 <- sce.clust.2[, keep]
+colData(sce.clust.2) <- droplevels(colData(sce.clust.2))
+summary(colData(sce.clust.2)$HTO_demuxmix)
+```
+
+At this point, the dataset contains only ‘labelled’ singlets, i.e. those droplets we are confident are single cells and that we can assign to a single donor and treatment. These are the cells we want to use in our downstream analysis.
+
+## Re-processing
+
+```{r}
+dec.block <- modelGeneVar(sce.clust.2, block=sce.clust.2$HTO_demuxmix)
+hvgs <- getTopHVGs(dec.block, var.threshold=0)
+hvgs <- setdiff(hvgs, union(ribo_set, mito_set))
+hvgs <- head(hvgs, 5000) # using 5000 HVGs to get more structure for identification of labelled singlets
+
+set.seed(101)
+sce.clust.3 <- fixedPCA(sce.clust.2,subset.row=hvgs)
+
+set.seed(102)
+sce.clust.3 <- runUMAP(sce.clust.3, dimred="PCA")
+
+set.seed(1004)
+clusters.nn <- clusterCells(sce.clust.3, use.dimred="PCA",BLUSPARAM=bluster::SNNGraphParam(k=50,cluster.fun="louvain"))
+table(clusters.nn)
+colLabels(sce.clust.3) <- clusters.nn
+#saveRDS(sce.clust.3, here("analysis","output","RDS","sce.filtered.clust.3.RDS"))
+```
+
+```{r, include=FALSE}
+sce.clust.3 <- readRDS(here("analysis","output","RDS","sce.filtered.clust.3.RDS"))
+```
+
+```{r, fig.cap="UMAP plot, where each point represents a droplet and is coloured according to the legend.",layout="l-body-outset", fig.width=6}
+plotUMAP(sce.clust.3,colour_by="label", text_by="label") + plotUMAP(sce.clust.3,colour_by="HTO_demuxmix")
+```
+
+```{r, fig.cap="Breakdown of clusters by experimental factors."}
+p1 <- ggcells(sce.clust.3) +
+  geom_bar(
+    aes(x = label, fill = HTO_demuxmix),
+    position = position_fill(reverse = TRUE)) +
+  coord_flip() +
+  xlab("Cluster") +
+  ylab("Frequency") +
+  theme_cowplot(font_size = 6) +
+  scale_fill_brewer(palette="Set2")
+p2 <- ggcells(sce.clust.3) +
+  geom_bar(aes(x = label, fill = label)) +
+  coord_flip() +
+  xlab("Cluster") +
+  ylab("Number of droplets") +
+  theme_cowplot(font_size = 6) +
+  ggthemes::scale_fill_tableau(palette="Tableau 20", direction=-1)
+p3 <- ggcells(sce.clust.3) +
+  geom_bar(aes(x = label, fill = sce.clust.3$demuxmix$HTO),position = position_fill(reverse = TRUE)) +
+  coord_flip() +
+  xlab("Cluster") +
+  ylab("Frequency") +
+  theme_cowplot(font_size = 6) +
+  scale_fill_brewer(palette="Set1")
+p1+p2+p3
+```
+
+# Cell type annotation
+
+Obtaining clusters of cells is fairly straightforward, but it is more difficult to determine what biological state is represented by each of those clusters. Doing so requires us to bridge the gap between the current dataset and prior biological knowledge, and the latter is not always available in a consistent and quantitative manner.
+
+To expedite this step, we can use various computational approaches that exploit prior information to assign meaning to an uncharacterized scRNA-seq dataset. The most obvious sources of prior information are the curated gene sets associated with particular biological processes, e.g., from the Gene Ontology (GO) or the Kyoto Encyclopedia of Genes and Genomes (KEGG) collections. Alternatively, we can directly compare our expression profiles to published reference datasets where each sample or cell has already been annotated with its putative biological state by domain experts.
+
+```{r}
+library(SingleR)
+library(celldex)
+library(dplyr)
+
+immgen <- celldex::ImmGenData()
+as.data.frame(colData(immgen)) %>%
+  dplyr::count(label.main, label.fine) %>%
+  dplyr::arrange(label.main) %>%
+  knitr::kable() 
+
+rnaseq <- celldex::MouseRNAseqData()
+as.data.frame(colData(rnaseq)) %>%
+  dplyr::count(label.main, label.fine) %>%
+  dplyr::arrange(label.main) %>%
+  knitr::kable()
+```
+
+We use both references to annotate the data set.
+
+* ILC = innate lymphoid cell
+* NKT = natural killer T cell
+* Tgd = gamma delta T cell
+
+```{r}
+# pred_cluster <- SingleR(test = sce.clust.3, assay.type.test=1, ref = list(imm=immgen, rna=rnaseq),labels = list(immgen$label.main, rnaseq$label.main))
+# saveRDS(pred_cluster, here("analysis","output","RDS","singleR_pred.RDS"))
+pred_cluster <- readRDS(here("analysis","output","RDS","singleR_pred.RDS"))
+
+# Check the final label from the combined assignment.
+table(pred_cluster$labels) 
+
+# Check the 'winning' reference for each cell.
+table(pred_cluster$reference) 
+
+sce.clust.3$cluster_label <- pred_cluster$labels
+table(sce.clust.3$label, sce.clust.3$cluster_label)
+
+library(janitor)
+tabyl(
+  data.frame(cluster = sce.clust.3$label, label = sce.clust.3$cluster_label),
+  label,
+  cluster) %>%
+  adorn_totals("col") %>%
+  adorn_percentages("col") %>%
+  adorn_pct_formatting() %>%
+  adorn_ns() %>%
+  adorn_title() %>%
+  knitr::kable(caption = "Labels for cells in each cluster.")
+```
+
+The labels are fairly unambiguous. 
+
+```{r, fig.cap="Heatmap of the assignment score for each cell (column) and label (row). Scores are shown before any fine-tuning and are normalized to [0, 1] within each cell."}
+plotScoreHeatmap(pred_cluster)
+```
+
+As there are few "B cells, pro" cells, we group "B cells" and "B cells, pro" together.
+
+```{r}
+sce.clust.3$cluster_label[sce.clust.3$cluster_label == "B cells, pro"] <- "B cells"
+
+pred_cluster[pred_cluster$labels=="B cells, pro",c("labels","pruned.labels")] <- "B cells"
+```
+
+We also group "NKT" and "Tgd" cells with "T cells".
+
+```{r}
+sce.clust.3$cluster_label[sce.clust.3$cluster_label == "NKT"] <- "T cells"
+pred_cluster[pred_cluster$labels=="NKT",c("labels","pruned.labels")] <- "T cells"
+sce.clust.3$cluster_label[sce.clust.3$cluster_label == "Tgd"] <- "T cells"
+pred_cluster[pred_cluster$labels=="Tgd",c("labels","pruned.labels")] <- "T cells"
+```
+
+We also group "Basophils" and "Neutrophils" cells with "Granulocytes".
+
+```{r}
+sce.clust.3$cluster_label[sce.clust.3$cluster_label == "Basophils"] <- "Granulocytes"
+pred_cluster[pred_cluster$labels=="Basophils",c("labels","pruned.labels")] <- "Granulocytes"
+sce.clust.3$cluster_label[sce.clust.3$cluster_label == "Neutrophils"] <- "Granulocytes"
+pred_cluster[pred_cluster$labels=="Neutrophils",c("labels","pruned.labels")] <- "Granulocytes"
+```
+
+```{r, fig.cap="Heatmap of the log-transformed number of cells in each combination of label (column) and cluster (row)."}
+tab <- table(cluster=sce.clust.3$cluster_label, label=sce.clust.3$label) 
+pheatmap::pheatmap(log10(tab+10))
+```
+
+```{r, fig.cap=" SingleR cell type labels overlayed on the UMAP plot."}
+plotUMAP(sce.clust.3, colour_by = "cluster_label", text_by = "label")
+```
+
+
+## Cluster refinement
+
+Some cells appear to be over-clustered in the UMAP, particularly in region containing clusters 5, 6, 8. Some other clusters may require further separation. 
+
+We try plotting known marker genes to try to refine the clusters.
+
+B cells
+
+```{r}
+b_markers <- c("Cd19","Cd79a","Cd22","Ighd")
+p1 <- plotExpression(sce.clust.3, features = b_markers, x = "cluster_label") + theme(axis.text.x = element_text(angle = 45, 
+    hjust = 1))
+p2 <- plotExpression(sce.clust.3, features = b_markers, x = "label")
+p1+p2
+```
+
+There is clear overlap between clusters 5, 6, 8, which were all labelled as B cells. We propose manually re-assigning them as one cluster.
+
+```{r}
+levels(sce.clust.3$label)[levels(sce.clust.3$label) %in% c(5,6,8)] <- 5
+levels(sce.clust.3$label)[levels(sce.clust.3$label) == 7] <- 6
+levels(sce.clust.3$label)[levels(sce.clust.3$label) == 9] <- 7
+levels(sce.clust.3$label)[levels(sce.clust.3$label) == 10] <- 8
+```
+
+```{r, fig.cap=" SingleR cell type labels overlayed on the UMAP plot."}
+plotUMAP(sce.clust.3, colour_by = "cluster_label", text_by = "label")
+```
+
+### Sub-clustering - cluster 4
+
+We try sub-clustering to achieve finer clustering resolution, starting with cluster 4.
+
+```{r}
+sce.4 <- sce.clust.3[,sce.clust.3$label==4]
+plotUMAP(sce.4, colour_by="cluster_label",text_by="label")
+```
+
+```{r}
+set.seed(78978)
+dec.4 <- modelGeneVar(sce.4, block=sce.4$HTO_demuxmix)
+hvgs <- getTopHVGs(dec.4,var.threshold = 0)
+hvgs <- setdiff(hvgs, union(ribo_set, mito_set))
+hvgs <- head(hvgs, 5000) 
+sce.4 <- denoisePCA(sce.4,technical=dec.4,subset.row=hvgs)
+
+g.4 <- buildSNNGraph(sce.4, use.dimred = "PCA")
+clusters.nn <- clusterCells(sce.4, use.dimred="PCA",BLUSPARAM=bluster::SNNGraphParam(k=50,cluster.fun="louvain"))
+table(clusters.nn)
+colLabels(sce.4) <- clusters.nn
+plotUMAP(sce.4,colour_by="cluster_label", text_by="label") 
+```
+
+Looking at B cell marker genes, we propose re-assigning sub-clusters 1, 5, 6, 7, 8 to one cluster.
+
+```{r}
+p1 <- plotExpression(sce.4 ,features = b_markers, x = "cluster_label") + theme(axis.text.x = element_text(angle = 45, 
+    hjust = 1))
+p2 <- plotExpression(sce.4, features = b_markers, x = "label")
+p1+p2
+```
+
+```{r, fig.cap="Heatmap of the log-transformed number of cells in each combination of label (column) and cluster (row)."}
+tab <- table(cluster=sce.4$cluster_label, label=sce.4$label) 
+pheatmap::pheatmap(log10(tab+10))
+```
+
+```{r}
+levels(sce.4$label)[levels(sce.4$label) %in% c(1,5,6,7,8)] <- 1
+```
+
+```{r, fig.cap=" SingleR cell type labels overlayed on the UMAP plot."}
+plotUMAP(sce.4, colour_by = "cluster_label", text_by = "label")
+```
+
+Below we will identify marker genes which are upregulated in each sub-cluster compared to all other sub-clusters.
+
+```{r}
+label_markers <- findMarkers(sce.4, sce.4$label, direction = "up", pval.type = "all")
+
+hm <- function(cluster) {
+  cluster_markers <- label_markers[[cluster]]
+  chosen <- rownames(cluster_markers)[1:50]
+  plotHeatmap(
+    sce.4,
+    order_columns_by = c("label", "HTO_demuxmix"),
+    features = chosen,
+    center = TRUE,
+    zlim = c(-5, 5),
+    color = hcl.colors(101, "Blue-Red 3"),
+    fontsize = 6,
+    main = cluster)
+}
+
+template <- c(
+  "::: {.panel}\n\n",
+  "## {{hm}}\n",
+  "```{r cluster-{{hm}}, fig.asp = 1.1, fig.cap = 'Heatmap showing the top marker genes in cluster `{{hm}}` compared to all other clusters.'}\n",
+  "hm('{{hm}}')\n",
+  "```",
+  "\n\n:::"
+)
+
+hm_list <- list(
+  "::::: {.panelset}",
+  lapply(levels(sce.4$label), function(hm) {
+    knitr::knit_expand(text = template)
+  }), 
+  ":::::")
+```
+
+`r knitr::knit(text = unlist(hm_list))`
+
+We integrate these sub-cluster labels into the original cluster labels.
+
+```{r}
+levels(sce.4$label) <- 4:7
+levels(sce.clust.3$label)[levels(sce.clust.3$label) %in% 5:8] <- 8:11
+label <- as.numeric(levels(colLabels(sce.clust.3)))[colLabels(sce.clust.3)]
+label[label==4]  <- as.numeric(levels(colLabels(sce.4)))[colLabels(sce.4)]
+colLabels(sce.clust.3) <- factor(label)
+```
+
+```{r, fig.cap=" SingleR cell type labels overlayed on the UMAP plot."}
+plotUMAP(sce.clust.3, colour_by = "cluster_label", text_by = "label")
+```
+
+### Sub-clustering - cluster 2
+
+```{r}
+sce.2 <- sce.clust.3[,sce.clust.3$label==2]
+plotUMAP(sce.2, colour_by="cluster_label",text_by="label")
+```
+
+```{r}
+set.seed(789789)
+dec.2 <- modelGeneVar(sce.2, block=sce.2$HTO_demuxmix)
+hvgs <- getTopHVGs(dec.2,var.threshold = 0)
+hvgs <- setdiff(hvgs, union(ribo_set, mito_set))
+hvgs <- head(hvgs, 5000) 
+sce.2 <- denoisePCA(sce.2,technical=dec.2,subset.row=hvgs)
+
+g.2 <- buildSNNGraph(sce.2, use.dimred = "PCA")
+clusters.nn <- clusterCells(sce.2, use.dimred="PCA",BLUSPARAM=bluster::SNNGraphParam(cluster.fun="louvain"))
+table(clusters.nn) # using default k to get finer clusters
+colLabels(sce.2) <- clusters.nn
+plotUMAP(sce.2,colour_by="cluster_label", text_by="label") 
+```
+
+Looking at the cell type labels, we propose re-assigning sub-clusters 1, 2, 3, 4, 5, 6 to one cluster.
+
+```{r, fig.cap="Heatmap of the log-transformed number of cells in each combination of label (column) and cluster (row)."}
+tab <- table(cluster=sce.2$cluster_label, label=sce.2$label) 
+pheatmap::pheatmap(log10(tab+10))
+```
+
+```{r}
+levels(sce.2$label)[levels(sce.2$label) %in% c(1,2,3,4,5,6)] <- 1
+levels(sce.2$label)[levels(sce.2$label) == 7] <- 2
+```
+
+```{r, fig.cap=" SingleR cell type labels overlayed on the UMAP plot."}
+plotUMAP(sce.2, colour_by = "cluster_label", text_by = "label")
+```
+
+Below we will identify marker genes which are upregulated in each sub-cluster compared to all other sub-clusters.
+
+```{r}
+label_markers <- findMarkers(sce.2, sce.2$label, direction = "up", pval.type = "all")
+
+hm <- function(cluster) {
+  cluster_markers <- label_markers[[cluster]]
+  chosen <- rownames(cluster_markers)[1:50]
+  plotHeatmap(
+    sce.2,
+    order_columns_by = c("label", "HTO_demuxmix"),
+    features = chosen,
+    center = TRUE,
+    zlim = c(-5, 5),
+    color = hcl.colors(101, "Blue-Red 3"),
+    fontsize = 6,
+    main = cluster)
+}
+
+template <- c(
+  "::: {.panel}\n\n",
+  "## {{hm}}\n",
+  "```{r cluster-{{hm}}, fig.asp = 1.1, fig.cap = 'Heatmap showing the top marker genes in cluster `{{hm}}` compared to all other clusters.'}\n",
+  "hm('{{hm}}')\n",
+  "```",
+  "\n\n:::"
+)
+
+hm_list <- list(
+  "::::: {.panelset}",
+  lapply(levels(sce.2$label), function(hm) {
+    knitr::knit_expand(text = template)
+  }), 
+  ":::::")
+```
+
+`r knitr::knit(text = unlist(hm_list))`
+
+We integrate these sub-cluster labels into the original cluster labels.
+
+```{r}
+levels(sce.2$label) <- 2:3
+levels(sce.clust.3$label)[levels(sce.clust.3$label) %in% 3:11] <- 4:12
+label <- as.numeric(levels(colLabels(sce.clust.3)))[colLabels(sce.clust.3)]
+label[label==2] <- as.numeric(levels(colLabels(sce.2)))[colLabels(sce.2)]
+colLabels(sce.clust.3) <- factor(label)
+```
+
+```{r, fig.cap=" SingleR cell type labels overlayed on the UMAP plot."}
+plotUMAP(sce.clust.3, colour_by = "cluster_label", text_by = "label")
+```
+
+### Sub-clustering - cluster 6
+
+```{r}
+sce.6 <- sce.clust.3[,sce.clust.3$label==6]
+plotUMAP(sce.6, colour_by="cluster_label",text_by="label")
+```
+
+```{r}
+set.seed(789789)
+dec.6 <- modelGeneVar(sce.6, block=sce.6$HTO_demuxmix)
+hvgs <- getTopHVGs(dec.6,var.threshold = 0)
+hvgs <- setdiff(hvgs, union(ribo_set, mito_set))
+hvgs <- head(hvgs, 5000) 
+sce.6 <- denoisePCA(sce.6,technical=dec.6,subset.row=hvgs)
+
+g.6 <- buildSNNGraph(sce.6, use.dimred = "PCA")
+clusters.nn <- clusterCells(sce.6, use.dimred="PCA",BLUSPARAM=bluster::SNNGraphParam(k=50,cluster.fun="louvain"))
+table(clusters.nn) # using default k to get finer clusters
+colLabels(sce.6) <- clusters.nn
+plotUMAP(sce.6,colour_by="cluster_label", text_by="label") 
+```
+
+Looking at the cell type labels, we propose re-assigning sub-clusters 1 and 2 to one cluster.
+
+```{r, fig.cap="Heatmap of the log-transformed number of cells in each combination of label (column) and cluster (row)."}
+tab <- table(cluster=sce.6$cluster_label, label=sce.6$label) 
+pheatmap::pheatmap(log10(tab+10))
+```
+
+```{r}
+levels(sce.6$label)[levels(sce.6$label) %in% c(1,2)] <- 1
+levels(sce.6$label)[levels(sce.6$label) == 3] <- 2
+```
+
+```{r, fig.cap=" SingleR cell type labels overlayed on the UMAP plot."}
+plotUMAP(sce.6, colour_by = "cluster_label", text_by = "label")
+```
+
+Below we will identify marker genes which are upregulated in each sub-cluster compared to all other sub-clusters.
+
+```{r}
+label_markers <- findMarkers(sce.6, sce.6$label, direction = "up", pval.type = "all")
+
+hm <- function(cluster) {
+  cluster_markers <- label_markers[[cluster]]
+  chosen <- rownames(cluster_markers)[1:50]
+  plotHeatmap(
+    sce.6,
+    order_columns_by = c("label", "HTO_demuxmix"),
+    features = chosen,
+    center = TRUE,
+    zlim = c(-5, 5),
+    color = hcl.colors(101, "Blue-Red 3"),
+    fontsize = 6,
+    main = cluster)
+}
+
+template <- c(
+  "::: {.panel}\n\n",
+  "## {{hm}}\n",
+  "```{r cluster-{{hm}}, fig.asp = 1.1, fig.cap = 'Heatmap showing the top marker genes in cluster `{{hm}}` compared to all other clusters.'}\n",
+  "hm('{{hm}}')\n",
+  "```",
+  "\n\n:::"
+)
+
+hm_list <- list(
+  "::::: {.panelset}",
+  lapply(levels(sce.2$label), function(hm) {
+    knitr::knit_expand(text = template)
+  }), 
+  ":::::")
+```
+
+`r knitr::knit(text = unlist(hm_list))`
+
+We integrate these sub-cluster labels into the original cluster labels.
+
+```{r}
+levels(sce.6$label) <- 6:7
+levels(sce.clust.3$label)[levels(sce.clust.3$label) %in% 7:12] <- 8:13
+label <- as.numeric(levels(colLabels(sce.clust.3)))[colLabels(sce.clust.3)]
+label[label==6] <- as.numeric(levels(colLabels(sce.6)))[colLabels(sce.6)]
+colLabels(sce.clust.3) <- factor(label)
+```
+
+```{r, fig.cap=" SingleR cell type labels overlayed on the UMAP plot."}
+plotUMAP(sce.clust.3, colour_by = "cluster_label", text_by = "label")
+```
+
+### Sub-clustering - cluster 8
+
+```{r}
+sce.8 <- sce.clust.3[,sce.clust.3$label==8]
+plotUMAP(sce.8, colour_by="cluster_label",text_by="label")
+```
+
+```{r}
+set.seed(7897897)
+dec.8 <- modelGeneVar(sce.8, block=sce.8$HTO_demuxmix)
+hvgs <- getTopHVGs(dec.8,var.threshold = 0)
+hvgs <- setdiff(hvgs, union(ribo_set, mito_set))
+hvgs <- head(hvgs, 5000) 
+sce.8 <- denoisePCA(sce.8,technical=dec.8,subset.row=hvgs)
+
+g.8 <- buildSNNGraph(sce.8, use.dimred = "PCA")
+clusters.nn <- clusterCells(sce.8, use.dimred="PCA",BLUSPARAM=bluster::SNNGraphParam(k=50,cluster.fun="louvain"))
+table(clusters.nn)
+colLabels(sce.8) <- clusters.nn
+plotUMAP(sce.8,colour_by="cluster_label", text_by="label") 
+```
+
+```{r, fig.cap="Heatmap of the log-transformed number of cells in each combination of label (column) and cluster (row)."}
+tab <- table(cluster=sce.8$cluster_label, label=sce.8$label) 
+pheatmap::pheatmap(log10(tab+10))
+```
+
+```{r, fig.cap=" SingleR cell type labels overlayed on the UMAP plot."}
+plotUMAP(sce.8, colour_by = "cluster_label", text_by = "label")
+```
+
+Below we will identify marker genes which are upregulated in each sub-cluster compared to all other sub-clusters.
+
+```{r}
+label_markers <- findMarkers(sce.8, sce.8$label, direction = "up", pval.type = "all")
+
+hm <- function(cluster) {
+  cluster_markers <- label_markers[[cluster]]
+  chosen <- rownames(cluster_markers)[1:50]
+  plotHeatmap(
+    sce.8,
+    order_columns_by = c("label", "HTO_demuxmix"),
+    features = chosen,
+    center = TRUE,
+    zlim = c(-5, 5),
+    color = hcl.colors(101, "Blue-Red 3"),
+    fontsize = 6,
+    main = cluster)
+}
+
+template <- c(
+  "::: {.panel}\n\n",
+  "## {{hm}}\n",
+  "```{r cluster-{{hm}}, fig.asp = 1.1, fig.cap = 'Heatmap showing the top marker genes in cluster `{{hm}}` compared to all other clusters.'}\n",
+  "hm('{{hm}}')\n",
+  "```",
+  "\n\n:::"
+)
+
+hm_list <- list(
+  "::::: {.panelset}",
+  lapply(levels(sce.2$label), function(hm) {
+    knitr::knit_expand(text = template)
+  }), 
+  ":::::")
+```
+
+`r knitr::knit(text = unlist(hm_list))`
+
+We integrate these sub-cluster labels into the original cluster labels.
+
+```{r}
+levels(sce.8$label) <- 8:10
+levels(sce.clust.3$label)[levels(sce.clust.3$label) %in% 9:13] <- 11:15
+label <- as.numeric(levels(colLabels(sce.clust.3)))[colLabels(sce.clust.3)]
+label[label==8] <- as.numeric(levels(colLabels(sce.8)))[colLabels(sce.8)]
+colLabels(sce.clust.3) <- factor(label)
+```
+
+```{r, fig.cap=" SingleR cell type labels overlayed on the UMAP plot."}
+plotUMAP(sce.clust.3, colour_by = "cluster_label", text_by = "label")
+```
+
+
+### Over-clustering
+
+Now that the above clusters have been sub-clustered, we try to see if the B cell and T cell clusters may have been over-clustered and should be re-assigned.
+
+```{r, fig.cap="Heatmap of the log-transformed number of cells in each combination of label (column) and cluster (row)."}
+tab <- table(cluster=sce.clust.3$cluster_label, label=sce.clust.3$label) 
+pheatmap::pheatmap(log10(tab+10))
+```
+
+B cells
+
+```{r}
+p1 <- plotExpression(sce.clust.3 ,features = b_markers, x = "cluster_label") + theme(axis.text.x = element_text(angle = 45, 
+    hjust = 1))
+p2 <- plotExpression(sce.clust.3, features = b_markers, x = "label")
+p1+p2
+```
+
+T cells 
+
+```{r}
+t_markers <- c("Trac", "Cd3d", "Cd4", "Cd3e", "Cd8a")
+p1 <- plotExpression(sce.clust.3, features = t_markers, x = "cluster_label") + theme(axis.text.x = element_text(angle = 45, 
+    hjust = 1))
+p2 <- plotExpression(sce.clust.3, features = t_markers, x = "label")
+p1+p2
+```
+
+We propose merging B cell clusters 5, 8 and 12, and T cell clusters 1, 2, 4, and reassign the cluster labels.
+
+```{r,eval=FALSE}
+levels(sce.clust.3$label)[levels(sce.clust.3$label) %in% c(1,2,4)] <- 1
+levels(sce.clust.3$label)[levels(sce.clust.3$label) == 3] <- 2
+levels(sce.clust.3$label)[levels(sce.clust.3$label) %in% c(5,8,12)] <- 3
+levels(sce.clust.3$label)[levels(sce.clust.3$label) %in% c(6:7,9,11,10,14,13,15)] <- 4:11
+sce.clust.3$cluster_label <- factor(sce.clust.3$cluster_label)
+# saveRDS(sce.clust.3,here("analysis","output","RDS","sce.labelled.RDS"))
+```
+
+```{r, fig.cap=" SingleR cell type labels overlayed on the UMAP plot."}
+sce.clust.3 <- readRDS(here("analysis","output","RDS","sce.labelled.RDS"))
+plotUMAP(sce.clust.3, colour_by = "cluster_label", text_by = "label")
+```
+
+```{r}
+label_markers <- findMarkers(sce.clust.3, sce.clust.3$label, direction = "up", pval.type = "all")
+
+hm <- function(cluster) {
+  cluster_markers <- label_markers[[cluster]]
+  chosen <- rownames(cluster_markers)[1:50]
+  plotHeatmap(
+    sce.clust.3,
+    order_columns_by = c("label", "HTO_demuxmix"),
+    features = chosen,
+    center = TRUE,
+    zlim = c(-5, 5),
+    color = hcl.colors(101, "Blue-Red 3"),
+    fontsize = 6,
+    main = cluster)
+}
+
+template <- c(
+  "::: {.panel}\n\n",
+  "## {{hm}}\n",
+  "```{r cluster-{{hm}}, fig.asp = 1.1, fig.cap = 'Heatmap showing the top marker genes in cluster `{{hm}}` compared to all other clusters.'}\n",
+  "hm('{{hm}}')\n",
+  "```",
+  "\n\n:::"
+)
+
+hm_list <- list(
+  "::::: {.panelset}",
+  lapply(levels(sce.clust.3$label), function(hm) {
+    knitr::knit_expand(text = template)
+  }), 
+  ":::::")
+```
+
+`r knitr::knit(text = unlist(hm_list))`
+
+## Marker gene sets
+
+Below are dot plots of the expression of marker genes that distinguish the cluster_label. We see that the neutrophil cells and basophils have a set of distinct markers, whereas the other cell types are less well-defined. NK cells are a subset of, and T cells are similar to, ILCs, which likely explains the overlapping marker gene sets.
+
+```{r, fig.cap="Dot plot of marker genes that distinguish the cluster_label. The size and color of each dot represents the proportion of cells with detected expression values and the average expression, respectively, for each feature in each group of cells.", fig.height=12}
+# all_markers <- metadata(pred_cluster)$de.genes
+all_markers <- getClassicMarkers(
+    ref = list(imm=immgen, rna=rnaseq),labels = list(immgen$label.main, rnaseq$label.main))
+
+collected <- list()
+for (lab in levels(sce.clust.3$cluster_label)) {
+  lab_markers <- unique(unlist(all_markers[[lab]]))
+  m <- match(lab_markers, rownames(label_markers[[lab]]))
+  m <- lab_markers[rank(m) <= 20]
+  collected[[lab]] <- plotDots(
+    sce.clust.3,
+    features = m,
+    group = "cluster_label",
+    block = "HTO_demuxmix") +
+    ggtitle(paste(lab, "markers")) +
+    guides(x = guide_axis(angle = 45)) +
+    theme(text = element_text(size = 8))
+}
+
+library(patchwork)
+wrap_plots(collected, ncol = 3) +
+  plot_annotation("Cell type labels")
+```
+
+# Session info {.appendix}
+
+The analysis and this document were prepared using the following software:
+
+<details>
+
+```{r}
+devtools::session_info()
+```
+
+</details>
+**Bioconductor version**: `r BiocManager::version()`
+
+
+
+
+
+
+

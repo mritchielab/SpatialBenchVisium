@@ -1,0 +1,855 @@
+---
+title: "CytAssist FFPE multi-sample analysis"
+description: |
+author:
+  - name: Mei Du
+date: "`r Sys.Date()`"
+output: 
+  distill::distill_article:
+    toc: true
+    toc_float: true
+    code_folding: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+library(here)
+library(SpatialExperiment)
+library(Seurat)
+library(ggplot2)
+library(tidyverse)
+library(patchwork)
+```
+
+
+# Notes
+
+nnSVG feature selection + iSC.MEB downstream analysis:
+
+* [nnSVG](https://www.biorxiv.org/content/10.1101/2022.05.16.492124v3)
+  + "For datasets consisting of multiple biological samples (e.g. multiple 10x Genomics Visium capture areas, or multiple tissue samples from other platforms), we can run nnSVG once per sample and combine the results by averaging the ranks of the SVGs identified per sample."
+
+* [iSC.MEB](https://academic.oup.com/bioinformaticsadvances/article/3/1/vbad019/7043976)
+  + "First, we perform principal component analysis (PCA) on the combined log-transformed expression matrix to obtain the top principal components (PCs). Second, by taking the top PCs as input, we perform the integrative spatial clustering analysis using iSC-MEB that produces the soft cluster assignment as output. Finally, we can perform downstream analysis using the clustering result from the second step."
+
+# Load data
+
+```{r}
+# pre-processed SpatialExperiment objects
+spe_709 <- readRDS(here("analysis","output","RDS","spe_709_FFPE_CA_norm.RDS"))
+spe_713 <- readRDS(here("analysis","output","RDS","spe_713_FFPE_CA_norm.RDS"))
+
+# Combining samples with SpatialExperiment's cbind()
+spe_709$sample_id <- "709"
+spe_713$sample_id <- "713"
+spe <- cbind(spe_709, spe_713)
+table(colData(spe)$sample_id)
+
+# HVGs
+hvg_709 <- read.csv(here("analysis","output","HVGs","709_FFPE_CA_top_HVGs.csv"))
+hvg_713 <- read.csv(here("analysis","output","HVGs","713_FFPE_CA_top_HVGs.csv"))
+```
+
+
+# nnSVG
+
+Run with included R and SLURM scripts.
+
+```{r,eval=FALSE}
+library(nnSVG)
+
+# Run nnSVG once per sample and store lists of top SVGs
+sample_ids <- unique(colData(spe)$sample_id)
+
+res_list <- as.list(rep(NA, length(sample_ids)))
+names(res_list) <- sample_ids
+colnames(rowData(spe)) <- c("gene_name","Chr")
+
+for (s in seq_along(sample_ids)) {
+  
+  # select sample
+  ix <- colData(spe)$sample_id == sample_ids[s]
+  spe_sub <- spe[, ix]
+  
+  # run nnSVG filtering for mitochondrial genes and low-expressed genes
+  spe_sub <- filter_genes(
+    spe_sub, 
+    filter_genes_ncounts = 3, 
+    filter_genes_pcspots = 0.5, 
+    filter_mito = TRUE
+  )
+  
+  # remove any zeros introduced by filtering
+  ix_zeros <- colSums(counts(spe_sub)) == 0
+  if (sum(ix_zeros) > 0) {
+    spe_sub <- spe_sub[, !ix_zeros]
+  }
+  
+  dim(spe_sub)
+  
+  # re-calculate logcounts after filtering
+  spe_sub <- computeLibraryFactors(spe_sub)
+  spe_sub <- logNormCounts(spe_sub)
+  
+  
+  # run nnSVG
+  set.seed(123)
+  spe_sub <- nnSVG(spe_sub)
+  
+  # store results for this sample
+  res_list[[s]] <- rowData(spe_sub)
+}
+
+# saveRDS(res_list, here("analysis","output","RDS","nnSVG_FFPE_CA.RDS"))
+```
+
+Now that we have run nnSVG once per sample, we can combine the results across multiple samples by averaging the ranks of the SVGs. Moran’s I statistic is used to rank genes as SVGs, with the highest values (close to +1) representing the top-ranked SVGs.
+
+```{r}
+res_list <- readRDS(here("analysis","output","RDS","nnSVG_FFPE_CA.RDS"))
+
+sample_ids <- unique(colData(spe)$sample_id)
+
+# number of genes that passed filtering for each sample
+sapply(res_list, nrow)
+
+# add another filter - by significance
+res_list_sig <- lapply(res_list, function(df) {
+    return(df[df$padj < 0.05,])
+})
+
+# number of genes that passed significance
+sapply(res_list_sig, nrow)
+
+# match results from each sample and store in matching rows
+res_ranks <- matrix(NA, nrow = nrow(spe), ncol = length(sample_ids))
+rownames(res_ranks) <- rownames(spe)
+colnames(res_ranks) <- sample_ids
+
+for (s in seq_along(sample_ids)) {
+  stopifnot(colnames(res_ranks)[s] == sample_ids[s])
+  stopifnot(colnames(res_ranks)[s] == names(res_list)[s])
+  
+  rownames_s <- rownames(res_list[[s]])
+  res_ranks[rownames_s, s] <- res_list[[s]][, "rank"]
+}
+
+# remove genes that were filtered out in all samples
+ix_allna <- apply(res_ranks, 1, function(r) all(is.na(r)))
+res_ranks <- res_ranks[!ix_allna, ]
+
+dim(res_ranks)
+
+# calculate average ranks
+# note missing values due to filtering for samples
+avg_ranks <- rowMeans(res_ranks, na.rm = TRUE)
+
+
+# calculate number of samples where each gene is within top 100 ranked SVGs
+# for that sample
+n_withinTop100 <- apply(res_ranks, 1, function(r) sum(r <= 100, na.rm = TRUE))
+
+
+# summary table
+df_summary <- data.frame(
+  gene_id = names(avg_ranks), 
+  gene_name = rowData(spe)[names(avg_ranks), "symbol"], 
+  #gene_type = rowData(spe)[names(avg_ranks), "gene_type"], 
+  overall_rank = rank(avg_ranks), 
+  average_rank = unname(avg_ranks), 
+  n_withinTop100 = unname(n_withinTop100), 
+  row.names = names(avg_ranks)
+)
+
+# sort by average rank
+df_summary <- df_summary[order(df_summary$average_rank), ]
+head(df_summary)
+
+# remove genes that were filtered out in all samples
+ix_allna <- apply(res_ranks, 1, function(r) all(is.na(r)))
+res_ranks <- res_ranks[!ix_allna, ]
+
+dim(res_ranks)
+
+# top n genes
+# (note: NAs in this example due to subsampling genes for faster runtime)
+top100genes <- df_summary$gene_name[1:100]
+
+# summary table of "replicated" SVGs (i.e. genes that are highly ranked in at
+# least x samples)
+df_summaryReplicated <- df_summary[df_summary$n_withinTop100 >= 2, ]
+
+# re-calculate rank within this set
+df_summaryReplicated$overall_rank <- rank(df_summaryReplicated$average_rank)
+
+dim(df_summaryReplicated)
+
+# top "replicated" SVGs
+topSVGsReplicated <- df_summaryReplicated$gene_name
+
+head(df_summary, 5)
+
+# saveRDS(df_summary, here("analysis","output","RDS","FFPE_CA_SVGs_.RDS"))
+```
+
+## Gene annotation
+
+```{r}
+svg <- readRDS(here("analysis","output","RDS","FFPE_CA_SVGs.RDS"))
+
+library(biomaRt)
+mart <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+svg_anno <- biomaRt::select(mart, keys=rownames(svg), keytype="external_gene_name",columns=c("external_gene_name","entrezgene_id"))
+colnames(svg_anno)[1] <- "gene_name"
+svg <- left_join(svg, svg_anno) %>% .[!is.na(.$entrezgene_id),]
+
+# duplicated
+svg[duplicated(svg[,"gene_name"]) | duplicated(svg[,"gene_name"], fromLast = TRUE),]
+
+library(clusterProfiler)
+library(org.Mm.eg.db)
+go <- enrichGO(gene = as.character(svg$entrezgene_id)[1:1000], 
+              OrgDb = org.Mm.eg.db,
+              ont = "BP",
+              pvalueCutoff = 0.05,
+              universe = as.character(svg$entrezgene_id),
+              readable =TRUE)
+# pdf(here("analysis","output","top1000_SVGs_GO_heatmap.pdf"),height=5)
+dotplot(go) + scale_colour_continuous(labels=scales::scientific_format(digits=1),low="royalblue3",high="orange")
+# dev.off()
+```
+
+## Spatial SVG expression
+
+```{r}
+# filter out haemoglobin/immunoglobin genes from top SVGs
+df_summary <- df_summary[-c(1:3),]
+# ix_gene <- c("Car2","Tmcc2") # use to plot top 2 HVGs in figure 3a
+
+# plot top genes
+for (i in 1:15) {
+  ix_gene <- which(rowData(spe)$symbol %in% df_summary[i, "gene_name"])
+
+  df <- as.data.frame(cbind(
+  colData(spe), 
+  spatialCoords(spe), 
+  gene = counts(spe)[ix_gene, ]))
+
+  plot <- ggplot(df, aes(x = pxl_col_in_fullres, y = pxl_row_in_fullres, color = gene)) + 
+  facet_wrap(~ sample_id, nrow = 1, scales = "free") + 
+  geom_point(size = 0.6) + 
+  scale_color_gradient(low = "gray80", high = "red", trans = "sqrt", 
+                       name = "counts", breaks = range(df$gene)) + 
+  scale_y_reverse() + 
+  ggtitle(paste0(i,". ",rowData(spe)$symbol[ix_gene])) + 
+  theme_bw() + 
+  theme(panel.grid = element_blank(), 
+        axis.title = element_blank(), 
+        axis.text = element_blank(), 
+        axis.ticks = element_blank(),
+        strip.background = element_rect(fill = "#DCEFFE", color = "#DCEFFE"),
+                          strip.text = element_text(color = "#074D6C", face = "bold", size = 15))
+
+  assign(paste0("p",i), plot)
+}
+
+# pdf(here("analysis","output","FFPE_CA_top2_SVGs.pdf"),height=2.3, width=7)
+p1+p2
+# dev.off()
+```
+
+```{r, fig.cap="The top 9 spatially variable genes across all samples.",layout="l-body-outset",fig.width=10, fig.height=10}
+p1+p2+p3+p4+p5+p6+p7+p8+p9
+```
+
+
+# iSC.MEB
+
+The SpatialExperiment objects must first be converted to Seurat objects.
+
+```{r}
+list.dirs.depth.n <- function(p, n) {
+  res <- list.dirs(p, recursive = FALSE)
+  if (n > 1) {
+    add <- list.dirs.depth.n(res, n-1)
+    c(res, add)
+  } else {
+    res
+  }
+}
+files <- list.dirs.depth.n("/stornext/Projects/score/Analyses/G000218_spatial_benchmarking_study/extdata/SpaceRanger", 2)
+run <- data.frame("709"="V42L05-390", "713"="V42L05-390")
+
+seu <- function(spe) {
+  names <- make.unique(rownames(spe))
+  rownames(spe) <- names
+  
+  # get images
+  img <- Read10X_Image(paste0(files[str_detect(files,paste0(run[,paste0("X", unique(spe$sample_id))],".*",unique(spe$sample_id)))], "/outs/spatial"), image.name = "tissue_hires_image.png")
+  
+  s <- CreateSeuratObject(
+    counts = counts(spe),
+    assay = "RNA",
+    meta.data = as.data.frame(colData(spe)))
+    s@meta.data <- s@meta.data[,c(1:3,5:6)]
+    colnames(s@meta.data)[4:5] <- c("row","col")
+    
+  return(s)
+}
+seu_list <- list(seu(spe_709), seu(spe_713))
+```
+
+"First, we perform principal component analysis (PCA) on the combined log-transformed expression matrix to obtain the top principal components (PCs). Second, by taking the top PCs as input, we perform the integrative spatial clustering analysis using iSC-MEB that produces the soft cluster assignment as output. Finally, we can perform downstream analysis using the clustering result from the second step."
+
+```{r}
+library(iSC.MEB)
+nnsvg_gene_list <- str_replace(df_summary$gene_id,"_","-") # match Seurat gene name format
+obj <- CreateiSCMEBObject(seu_list, customGenelist = nnsvg_gene_list) # using custom gene list from nnSVG
+
+# Add adjacency matrix list for a iSCMEBObj object to prepare for iSC.MEB model fitting.
+obj <- CreateNeighbors(obj, platform="Visium")
+
+# run PCA to get low dimensional embeddings
+obj <- iSC.MEB::runPCA(obj, npcs = 10, pca.method = "APCA")
+
+# Add a model setting in advance for an iSCMEBObj object.
+obj <- SetModelParameters(obj, verbose = TRUE, maxIter=20, coreNum=4)
+```
+
+For function iSCMEB, users can specify the number of clusters K or set K to be an integer vector by using modified MBIC(BIC) to determine K. Here, we use user-specified number of clusters. 
+
+```{r}
+# 9 69347
+# 10 68887
+# 11 69274
+
+# couldn't do K=m:n as in the tutorial - C stack usage over the limit - run iSCMEB() with each K and plot individually
+obj <- iSCMEB(obj, K=8)
+SelectKPlot(obj, criteria = "MBIC")
+```
+
+## Visualisation
+
+```{r, fig.cap= "Spatial scatter plot."}
+cols = c("#fb8072", "#bebada",  "#8dd3c7","#B5E8F9","#ffffb3",  "#b3de69", "#fdb462", "#FAABAB", "#fdd900", "#F9C8ED", "#55A5E8")
+p1 <- SpaHeatMap(obj, item = "cluster", plot_type = "Scatter", nrow.legend = 1, no_axis = TRUE, cols = cols, point_size=1.75, combine=TRUE)
+p1
+```
+
+Next, the user can visualize the inferred embeddings for biological effects between cell/domain types using two components from either tSNE or UMAP. Here, we demonstrate the clustering and batch remove performance by UMAP plot.
+
+```{r, fig.cap="UMAP plot."}
+obj <- CalculateUMAP(obj, reduction = "iSCMEB", n_comp = 2)
+
+umap2 <- LowEmbedPlot(obj, item = "cluster", reduction = "UMAP2", point_size = 0.3)
+umap3 <- LowEmbedPlot(obj, item = "batch", reduction = "UMAP2", point_size = 0.3)
+umap2 + umap3
+```
+
+## DE
+
+The IntegrateSpaData function can integrate multiple SRT data based on our results, function doDEG provide top differential expression genes, and function doHeatmap plot heatmap.
+
+DE between spatial clusters.
+
+```{r, fig.cap="Heatmap of combined DE analysis.",layout="l-body-outset",fig.width=10, fig.height=8}
+seuInt <- IntegrateSpaData(obj,"mouse") # "mouse" indicates which species' housekeeping genes to use
+top10 <- doDEG(seuInt, topn = 10)
+p4 <- doHeatmap(seuInt, top10$gene)
+p4
+```
+
+## Over-clustering
+
+```{r}
+spat_clust <- obj@resList@idents
+for (i in 1:2) {
+  spat_clust[[i]][spat_clust[[i]]==4] <- 2
+  spat_clust[[i]][spat_clust[[i]]==5] <- 4
+  spat_clust[[i]][spat_clust[[i]]==6] <- 5
+  spat_clust[[i]][spat_clust[[i]]==7] <- 6
+  spat_clust[[i]][spat_clust[[i]]==8] <- 7
+}
+obj@resList@idents <- spat_clust
+```
+
+## Visualisation
+
+Next, the user can visualize the inferred embeddings for biological effects between cell/domain types using two components from either tSNE or UMAP. Here, we demonstrate the clustering and batch remove performance by UMAP plot.
+
+```{r, fig.cap="UMAP plot."}
+obj <- CalculateUMAP(obj, reduction = "iSCMEB", n_comp = 2)
+
+p2 <- LowEmbedPlot(obj, item = "cluster", reduction = "UMAP2", point_size = 0.3)
+p3 <- LowEmbedPlot(obj, item = "batch", reduction = "UMAP2", point_size = 0.3)
+p2 + p3
+
+# pdf(here("analysis","output","FFPE_CA_multi-sample_UMAP.pdf"), height=4, width=5)
+p2
+# dev.off()
+
+# pdf(here("analysis","output","FFPE_CA_multi-sample_UMAP_batch.pdf"), height=4, width=5)
+p3
+# dev.off()
+
+# saveRDS(obj,here("analysis","output","RDS","FFPE_CA_iSCMEB_obj.RDS"))
+```
+
+## DE
+
+The IntegrateSpaData function can integrate multiple SRT data based on our results, function doDEG provide top differential expression genes, and function doHeatmap plot heatmap.
+
+DE between spatial clusters.
+
+```{r, fig.cap="Heatmap of combined DE analysis.", ,layout="l-body-outset",fig.width=10, fig.height=8}
+seuInt <- IntegrateSpaData(obj,"mouse") # "mouse" indicates which species' housekeeping genes to use
+top10 <- doDEG(seuInt, topn = 10)
+p4 <- doHeatmap(seuInt, top10$gene)
+p4
+```
+
+
+# Results and annotation
+
+## Spatial marker gene expression
+
+```{r, fig.cap="B marker gene expression.",layout="l-body-outset",fig.width=10, fig.height=10}
+for (i in 1:length(b_markers)) {
+  ix_gene <- which(rowData(spe)$symbol %in% b_markers[i])
+
+  df <- as.data.frame(cbind(
+  colData(spe), 
+  spatialCoords(spe), 
+  gene = counts(spe)[ix_gene, ]))
+
+  plot <- ggplot(df, aes(x = pxl_col_in_fullres, y = pxl_row_in_fullres, color = gene)) + 
+  facet_wrap(~ sample_id, nrow = 1, scales = "free") + 
+  geom_point(size = 0.6) + 
+  scale_color_gradient(low = "gray80", high = "red", trans = "sqrt", 
+                       name = "counts", breaks = range(df$gene)) + 
+  scale_y_reverse() + 
+  ggtitle(paste0(rowData(spe)$symbol[ix_gene], " expression")) + 
+  theme_bw() + 
+  theme(aspect.ratio = 1, 
+        panel.grid = element_blank(), 
+        plot.title = element_text(face = "italic"), 
+        axis.title = element_blank(), 
+        axis.text = element_blank(), 
+        axis.ticks = element_blank())
+    assign(paste0("b",i), plot)
+}
+b1+b2+b3+b4+b5
+```
+
+```{r, fig.cap="T marker gene expression.",layout="l-body-outset",fig.width=10, fig.height=10}
+for (i in 1:length(t_markers)) {
+  ix_gene <- which(rowData(spe)$symbol %in% t_markers[i])
+
+  df <- as.data.frame(cbind(
+  colData(spe), 
+  spatialCoords(spe), 
+  gene = counts(spe)[ix_gene, ]))
+
+  plot <- ggplot(df, aes(x = pxl_col_in_fullres, y = pxl_row_in_fullres, color = gene)) + 
+  facet_wrap(~ sample_id, nrow = 1, scales = "free") + 
+  geom_point(size = 0.6) + 
+  scale_color_gradient(low = "gray80", high = "red", trans = "sqrt", 
+                       name = "counts", breaks = range(df$gene)) + 
+  scale_y_reverse() + 
+  ggtitle(paste0(rowData(spe)$symbol[ix_gene], " expression")) + 
+  theme_bw() + 
+  theme(aspect.ratio = 1, 
+        panel.grid = element_blank(), 
+        plot.title = element_text(face = "italic"), 
+        axis.title = element_blank(), 
+        axis.text = element_blank(), 
+        axis.ticks = element_blank())
+
+  assign(paste0("t",i), plot)
+}
+t1+t2+t3+t4+t5
+```
+
+
+## Spatial clusters
+
+Get spots in the same cell type in each sample
+
+```{r}
+deg <- doDEG(seuInt, topn=nrow(seuInt))
+```
+
+```{r,layout="l-body-outset",fig.width=10, fig.height=10}
+colData(spe)$cluster <- unlist(spat_clust)
+
+for (i in 1:8) {
+  df <- as.data.frame(cbind(
+    colData(spe),
+    spatialCoords(spe)))
+  
+  df[df$cluster==i,"fill"] <- TRUE
+  df[df$cluster!=i,"fill"] <- FALSE
+
+  plot <- ggplot(df, aes(x = pxl_col_in_fullres, y = -pxl_row_in_fullres, color = fill)) + 
+  facet_wrap(~ sample_id, nrow = 1, scales = "free") + 
+  geom_point(size = 0.5) + 
+  scale_colour_manual(values=c("TRUE"="red", "FALSE"="gray90")) +
+  ggtitle(paste("Cluster",i)) + 
+  theme_bw() + 
+  theme(aspect.ratio = 1, 
+        panel.grid = element_blank(), 
+        axis.title = element_blank(), 
+        axis.text = element_blank(), 
+        axis.ticks = element_blank(),
+        strip.background = element_rect(fill = "#DCEFFE", color = "#DCEFFE"),
+                          strip.text = element_text(color = "#074D6C", face = "bold", size = 15),
+          panel.background = element_rect(fill = NA)) 
+
+  assign(paste0("c",i), plot)
+}
+wrap_plots(c1,c2,c3,c4,c5,c6,c7,c8,nrow=3)
+
+
+# png(here("analysis","output","FFPE_CA_cluster7.png"),height=2.5,width=7.5,units="in",bg="transparent", res=300)
+# c7
+# dev.off()
+```
+
+### Gene expression per spot
+
+```{r}
+# gene expr per spot
+GeneExprSum_spot <- function(spatial_experiment_object, genes, colname) {
+  common_genes <- intersect(rowData(spatial_experiment_object)$symbol, genes)
+  spatial_experiment_object <- spatial_experiment_object[common_genes, ]
+  genes_summed <- colSums(as.matrix(counts(spatial_experiment_object)))
+  colData(spatial_experiment_object)[[colname]] <- genes_summed
+  return(spatial_experiment_object)
+}
+
+for (i in 1:7) {
+  df <- as.data.frame(cbind(
+    colData(spe),
+    spatialCoords(spe)))
+  df$genes_sum <- GeneExprSum_spot(spe,t_markers,"genes_sum")$genes_sum
+  
+  df[df$cluster==i,"fill"] <- TRUE
+  df[df$cluster!=i,"fill"] <- FALSE
+
+plot <- ggplot(df, aes(x = pxl_col_in_fullres, y = -pxl_row_in_fullres,)) + 
+  facet_wrap(~ sample_id, nrow = 1, scales = "free") + 
+  geom_point(data = subset(df, cluster!=i), aes(color = genes_sum), size = 0.8, color = "gray95") + #show tissue but grey out
+  geom_point(data = subset(df, cluster==i), aes(color = genes_sum), size = 0.8) +
+  scale_color_distiller(palette="Oranges",direction= 1) +
+  theme_bw() + 
+  theme(aspect.ratio = 1, 
+        panel.grid = element_blank(), 
+        axis.title = element_blank(), 
+        axis.text = element_blank(), 
+        axis.ticks = element_blank(),
+        strip.background = element_rect(fill = "#DCEFFE", color = "#DCEFFE"),
+                          strip.text = element_text(color = "#074D6C", face = "bold", size = 15))
+
+  assign(paste0("c",i), plot)
+}
+wrap_plots(c1,c2,c3,c4,c5,c6,c7,nrow=3)
+
+
+# pdf(here("analysis","output","FFPE_CA_Tcell_exp.pdf"),height=2.5,width=7.5)
+c7
+# dev.off()
+
+```
+
+### Assign labels
+
+```{r,layout="l-body-outset",fig.width=10, fig.height=8}
+df <- as.data.frame(cbind(
+    colData(spe),
+    spatialCoords(spe)))
+  
+df[df$cluster==1,"fill"] <- "Red pulp"
+df[df$cluster==2,"fill"] <- "B cell"
+df[df$cluster==3,"fill"] <- "Germinal centre"
+df[df$cluster==4,"fill"] <- "Neutrophil"
+df[df$cluster==5,"fill"] <- "Red pulp"
+df[df$cluster==6,"fill"] <- "Plasma cell"
+df[df$cluster==7,"fill"] <- "T cell"
+
+# Define the order of clusters
+cluster_order <- c("B cell", "Germinal centre", "Neutrophil", "Red pulp", "Plasma cell", "T cell")
+
+# Convert 'fill' column to a factor and specify the levels
+df$fill <- factor(df$fill, levels = cluster_order)
+
+pal <- RColorBrewer::brewer.pal(6,"Set2")[c(1,3,5,4,6,2)]
+
+labelled_plot <- ggplot(df, aes(x = pxl_col_in_fullres, y = -pxl_row_in_fullres, color = fill)) + 
+  facet_wrap(~ sample_id, nrow = 1, scales = "free") + 
+  geom_point(size = 0.8) + 
+  scale_color_manual(values=pal) +
+  theme_bw() + 
+  theme(aspect.ratio = 1, 
+        panel.grid = element_blank(), 
+        axis.title = element_blank(), 
+        axis.text = element_blank(), 
+        axis.ticks = element_blank(),
+        legend.text = element_text(size=11),
+        legend.title = element_blank(),
+        strip.background = element_blank(),
+        strip.text = element_text(color = "#074D6C", face = "bold", size = 15)) +
+  guides(color = guide_legend(override.aes = list(size = 5)))
+
+# pdf(here("analysis","output","FFPE_CA_labelled.pdf"), height=3,width=9)
+labelled_plot
+# dev.off()
+```
+
+### Cluster score heatmap
+
+```{r}
+# function for logfc matrix
+logfc_mtx <- function(spe, cluster_label, marker_genes_df) {
+  args.grid <- expand.grid(
+    zone = as.character(unique(marker_genes_df$zone)),
+    cluster = as.character(unique(cluster_label))
+  ) |>
+    tibble::as_tibble()
+
+  parallel::mcmapply(function(zone, cluster) {
+    rows <- marker_genes_df[marker_genes_df$zone == zone, "gene"]
+    cols <- cluster_label == cluster
+    cluster_score <- sum(SingleCellExperiment::counts(spe[rows, cols])) / sum(cols)
+    other_score <- sum(SingleCellExperiment::counts(spe[rows, !cols])) / sum(!cols)
+    tibble::tibble_row(
+      zone = zone,
+      cluster = cluster,
+      logfc = log2(cluster_score / other_score)
+    )
+  }, args.grid$zone, args.grid$cluster, mc.cores = 4, SIMPLIFY = F) |>
+    dplyr::bind_rows()
+}
+
+# markers df 
+anno <- biomaRt::select(mart, keys=rownames(spe), keytype="external_gene_name",columns=c("external_gene_name","ensembl_gene_id"))
+colnames(anno) <- c("symbol", "EnsembleID")
+
+zone_markers_df <- 
+list(
+    "Macrophage" = c("Cd274", "Marco", "Csf1r", "Adgre1", "Cd209b", "Cd206", "Cd80", "Mac1", "Cd68")[c(1, 3, 4, 5, 7, 9)],
+    "B cell" = c("Cd19", "Cd22", "Ighd", "Cd5"),
+    "Germinal centre" = c("Cxcr4", "Cd83", "Bcl6", "Rgs13", "Aicda"),
+    "Neutrophil" = c("S100a9", "S100a8", "Ngp"),
+    "Erythrocyte" = c("Car2", "Car1", "Klf1"),
+    "Plasma cell" = c("Cd38", "Cd138", "Xbp1", "Irf4", "Prdm1", "Cd27", "Cd319", "Mum1")[c(1, 3, 4, 5, 6)],
+    "T cell" = c("Trac", "Cd3d", "Cd4", "Cd3e", "Cd8a"),
+    "Red pulp" = c("Ifitm3", "C1qc", "Hmox1", "Hba-a1", "Klf1"),
+    "Marginal zone" = c("Marco", "Lyz2", "Ighd", "Igfbp7", "Igfbp3", "Ly6d"),
+    "White pulp" = c("Ighd", "Cd19", "Trac", "Trbc2")
+  ) |>
+    stack() |>
+    setNames(c("gene", "zone")) |>
+    merge(rowData(spe), # any spe with all EnsembleIDs and symbols for the markers should be fine
+      by.x = "gene",
+      by.y = "symbol"
+    ) |>
+    na.omit()
+
+# plot
+# spe_wtctrl
+# cluster_wtctrl: factor same length as spe's cols
+colData(spe)$cluster <- unlist(spat_clust)
+cluster <- colData(spe)$cluster
+p <- logfc_mtx(spe, cluster, zone_markers_df) |>
+        ggplot(aes(
+          x = factor(cluster, levels = 1:7),
+          y = factor(zone, levels = rev(levels(zone_markers_df$zone))), fill = logfc
+        )) +
+        geom_tile(
+          color = "white",
+          lwd = 0.5,
+          linetype = 1
+        ) +
+        theme_void() +
+        theme(
+          axis.title = element_blank(), plot.title = element_text(hjust = 0.5),
+          axis.text = element_text(size = 12), legend.title = element_blank(),
+          legend.text = element_text(size = 12)
+        ) +
+        geom_text(aes(label = format(round(logfc, digits = 1), nsmall = 1)), color = "black", size = 4) +
+        scale_fill_distiller(palette = "RdBu") +
+        coord_fixed()
+      # ggsave(file.path("output", "WT_CTL_heatmap.jpg"), p, width = 15, height = 15, dpi = 600, units = "cm")
+      # file.path("output", "WT_CTL_heatmap.jpg")
+
+# pdf(here("analysis","output","FFPE_CA_cluster_score_heatmap.pdf"),height=5,width=6)
+p
+# dev.off()
+```
+
+## HVGs vs nnSVG
+
+HVGs were selected using `scran` methods and purely defined on molecular features i.e. gene expression, not taking any spatial information into account.
+
+```{r}
+library(UpSetR)
+hvg_709 <- hvg_709[order(hvg_709$p.value),]
+hvg_713 <- hvg_713[order(hvg_713$p.value),]
+
+list_input <- list(SVG_multi=rownames(df_summary), 
+                   # SVG_709=names(res_ranks[,"709"][order(res_ranks[,"709"])]),
+                   # SVG_713=names(res_ranks[,"713"][order(res_ranks[,"713"])]),
+                   HVG_709=hvg_709$X, 
+                   HVG_713=hvg_713$X)
+
+# returns number of overlaps
+top_n <- function(n) {
+  top <- data.frame(list_input[[1]][1:n],
+                    list_input[[2]][1:n],
+                    list_input[[3]][1:n])#,
+                    # list_input[[4]][1:n],
+                    # list_input[[5]][1:n])
+  length(Reduce(intersect, top))
+}
+
+n_overlap <- sapply(1:length(rownames(df_summary)), top_n)
+max_index <- which.max(n_overlap / 1:length(rownames(df_summary))) # index of highest overlap - 541
+n_overlap[max_index] / max_index # highest overlap - 0.76
+
+# upset plot of the highest overlap
+print(paste("Highest proportion of overlap:",round(n_overlap[which.max(n_overlap)],2)))
+top <- list(SVG_multi=rownames(df_summary)[1:max_index],
+            # SVG_709=names(res_ranks[,"709"][order(res_ranks[,"709"])])[1:which.max(n_overlap)],
+            # SVG_713=names(res_ranks[,"713"][order(res_ranks[,"713"])])[1:which.max(n_overlap)],
+            HVG_709=hvg_709$X[1:max_index],
+            HVG_713=hvg_713$X[1:max_index])
+
+# pdf(here("analysis","output","SVG_HVG_overlap.pdf"),height=5,width=7)
+upset(fromList(top), 
+      order.by = "freq",
+      keep.order=TRUE,
+      nsets=5,
+      set_size.show=FALSE,
+      text.scale=c(1.5, 1.5, 1.5, 1.5, 1.5, 2))
+# dev.off()
+```
+
+
+# Deconvolution
+
+```{r}
+library(spacexr)
+sce <- readRDS(here("analysis","output","RDS","sce.labelled.RDS"))
+counts <- counts(sce)
+rownames(counts) <- make.names(rownames(counts), unique=TRUE)
+
+# process_cell_type_info error: need a minimum of 25 cells for each cell type in the reference
+# fix: collapse into groups, myeloid: macrophage, monocyte, granulocyte: basophil, neutrophil, b cell: b cells, b cells, pro
+cell_types <- as.character(sce$cluster_label); names(cell_types) <- sce$Barcode # create cell_types named list
+# cell_types[cell_types %in% c("Macrophages","Monocytes","Stem cells","Granulocytes")] <- "Haematopoietic"
+cell_types[cell_types %in% c("DC","NK cells","ILC")] <- "Immune"
+cell_types <- as.factor(cell_types) # convert to factor data type
+nUMI <- sce$sum; names(nUMI) <- sce$Barcode # create nUMI named list
+
+### Create the Reference object
+reference <- Reference(counts, cell_types, nUMI)
+```
+
+```{r, eval=FALSE}
+for (i in 1){ # had to run separately
+  hcc_st_s = seu_list[[i]]
+  st_count = hcc_st_s@assays$RNA@counts
+  st_coord = hcc_st_s@meta.data[,c('row','col')]
+  nUMI <- colSums(st_count)
+  puck <- SpatialRNA(st_coord, st_count, nUMI)
+  output_name = paste0('FFPE_CA_RCTD_',i,"_grouped.RDS")
+  myRCTD <- create.RCTD(puck, reference, max_cores = 2)
+  myRCTD <- run.RCTD(myRCTD, doublet_mode = 'multi')
+  assign(paste0("myRCTD_",i),myRCTD)
+  saveRDS(myRCTD,here("analysis","output","RDS",output_name))}
+```
+
+```{r}
+myRCTD_1 <- readRDS(here("analysis","output","RDS","FFPE_CA_RCTD_1_grouped.RDS"))
+myRCTD_2 <- readRDS(here("analysis","output","RDS","FFPE_CA_RCTD_2_grouped.RDS"))
+
+# get confident cell type proportions for each spot - sub_weights already normalised to sum to 1
+for (i in 1:2) {
+  all_weights <- list()
+  myRCTD <- get(paste0("myRCTD_",i))
+  weights <- data.frame(matrix(ncol=9))
+  colnames(weights) <- levels(cell_types)
+  for (j in 1:length(myRCTD@results)) {
+    a <- data.frame(t(myRCTD@results[[j]]$sub_weights))
+    colnames(a) <- myRCTD@results[[j]]$cell_type_list
+    all_weights <- c(all_weights, list(a))
+  } 
+  weights <- dplyr::bind_rows(all_weights)
+  weights[is.na(weights)] <- 0
+  rownames(weights) <- rownames(get(paste0("myRCTD_",i))@spatialRNA@coords)
+  assign(paste0("weights_",i), weights)
+}
+
+cell_type_names <- c("B cells","T cells","Erythrocytes","Myeloid")
+for (j in 1:2) {
+  assign(paste0("plot_",j), plot_weights("Erythrocytes", get(paste0("myRCTD_",j))@spatialRNA, get(paste0("weights_",j))))
+}
+
+# Create an empty list to store data frames
+df_list <- list()
+
+for (j in 1:2) {
+  weights <- get(paste0("weights_",j))
+  spatialRNA <- get(paste0("myRCTD_",j))@spatialRNA
+  
+  # Create a data frame for ggplot
+  df <- data.frame(
+    x = spatialRNA@coords[,1],
+    y = spatialRNA@coords[,2],
+    weight = weights[,"T cells"], # Erythrocytes for supplementary figure S7
+    source = ifelse(j == 1, "709", "713")  # Add source column
+  )
+  
+  # Add the data frame to the list
+  df_list[[j]] <- df
+}
+
+# Combine the data frames
+df_combined <- do.call(rbind, df_list)
+
+deconv_plot <- ggplot(df_combined, aes(x = y, y = -x)) + 
+  facet_wrap(~ source, nrow = 1, scales = "free") + 
+  geom_point(data = subset(df_combined, weight < 0.2), aes(color = weight), size = 0.8, color = "gray90") + # add low weights to show tissue but grey out
+  geom_point(data = subset(df_combined, weight >= 0.2), aes(color = weight), size = 0.8) +
+  scale_color_gradientn(colors = pals::kovesi.rainbow(20), limits=c(0,1)) + # copy over spacexr's weights plotting
+  theme_bw() + 
+  theme(aspect.ratio = 1, 
+        panel.grid = element_blank(), 
+        axis.title = element_blank(), 
+        axis.text = element_blank(), 
+        axis.ticks = element_blank(),
+        strip.background = element_rect(fill = "#DCEFFE", color = "#DCEFFE"),strip.text = element_text(color = "#074D6C", face = "bold", size = 15))
+
+# pdf(here("analysis","output","FFPE_CA_deconv.pdf"),height=2.5,width=7.5)
+deconv_plot
+# dev.off()
+```
+
+
+# Session info {.appendix}
+
+The analysis and this document were prepared using the following software:
+
+<details>
+
+```{r}
+devtools::session_info()
+```
+
+</details>
+**Bioconductor version**: `r BiocManager::version()`
+
+
+
+

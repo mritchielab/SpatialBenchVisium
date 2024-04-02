@@ -1,0 +1,418 @@
+---
+title: "713 FFPE CytAssist"
+description: First-pass EDA and QC
+author:
+  - name: Mei Du
+date: "`r Sys.Date()`"
+output: 
+  distill::distill_article:
+    toc: true
+    toc_float: true
+    code_folding: true
+editor_options:
+  chunk_output_type: console
+---
+```{r}
+library(here)
+library(SpatialExperiment)
+library(Seurat)
+library(cowplot)
+library(ggspavis)
+library(RColorBrewer)
+library(scater)
+library(scran)
+library(pheatmap)
+library(tidyverse)
+library(Mus.musculus)
+library(biomaRt)
+
+dir <- "/stornext/Projects/score/Analyses/G000218_spatial_benchmarking_study/extdata/SpaceRanger"
+```
+
+# Load data
+
+```{r}
+list.dirs.depth.n <- function(p, n) {
+  res <- list.dirs(p, recursive = FALSE)
+  if (n > 1) {
+    add <- list.dirs.depth.n(res, n-1)
+    c(res, add)
+  } else {
+    res
+  }
+}
+files <- list.dirs.depth.n(dir, 2)
+```
+
+```{r panelset, echo=FALSE, include=FALSE}
+xaringanExtra::use_panelset()
+```
+
+```{r}
+# SpatialExperiment object
+spe_713 <- read10xVisium(files[str_detect(files,"V42L05-390/.*713")], type="sparse", data="raw", images="lowres", load=TRUE)
+
+# Seurat object
+seu_713 <- Load10X_Spatial(paste0(files[str_detect(files,"V42L05-390/.*713")], "/outs"))
+```
+
+The SpatialExperiment object is the main data structure used in this analysis following OSTA and is based on the output folder from `spaceranger count`. 
+
+```{r}
+spe_713
+```
+
+The Seurat object is another data structure that we mainly use for visualisation here.
+
+```{r}
+seu_713
+```
+
+The SpatialExperiment object is the main data structure used in this analysis following OSTA and is based on the output folder from `spaceranger count`. 
+
+```{r}
+spe_713
+```
+
+The Seurat object is another data structure that we mainly use for visualisation here.
+
+```{r}
+seu_713
+```
+
+## Gene annotation
+
+```{r}
+# get chromosome names
+mart <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+chr <- biomaRt::select(mart, keys=rownames(spe_713), keytype="ensembl_gene_id",columns=c("ensembl_gene_id","chromosome_name"))
+rowData(spe_713)[rownames(rowData(spe_713)) %in% chr$ensembl_gene_id,"Chr"] <- chr$chromosome_name
+
+# make gene symbols rownames
+rownames(spe_713) <- rowData(spe_713)$symbol
+```
+
+
+# Visualise data
+
+Looking at the distribution and spatial clustering of the gene expression data (nCount_Spatial).
+
+```{r, fig.cap="Violin plot (left) and spatial feature plot (right) of sample 713 gene expression data."}
+p1 <- VlnPlot(seu_713, features = "nCount_Spatial", pt.size = 0.1) + NoLegend()
+p2 <- SpatialFeaturePlot(seu_713, features = "nCount_Spatial", image.alpha=0.35, pt.size.factor=2) + theme(legend.position = "right")
+plot_grid(p1, p2)
+```
+
+
+
+# Quality control at the spot level {.panelset}
+
+Quality thresholds were previously adjusted manually, guided by spot visualisation, but as thresholds varied (sometimes greatly) between different samples, we try using `scuttle`'s outlier detection function instead. "This defines the threshold at a certain number of median absolute deviations (MADs) away from the median; values beyond this threshold are considered outliers and can be filtered out, assuming that they correspond to low-quality cells."
+
+* For library size (sum), small outliers are detected (low_lib_size). These are considered to represent low-quality cells that have not been sufficiently sequenced. Detection is performed on the log-scale to adjust for a heavy right tail and to improve resolution at zero.
+
+* For number of detected features per cell (detected), small outliers are detected (low_n_features). These are considered to represent low-quality cells with low-complexity libraries. Detection is performed on the log-scale to adjust for a heavy right tail and to improve resolution at zero.
+
+* For each column specified by `sub.fields`, large outliers are detected (high_subsets_mito_percent). This aims to remove cells with high spike-in or mitochondrial content, usually corresponding to damaged cells. 
+
+::::: {.panelset}
+
+::: {.panel}
+
+## Calculate metrics using `scater`
+
+```{r}
+# spe_713 <- readRDS(here("analysis","output","RDS","spe_713.RDS"))
+
+# keep only spots over tissue
+spe_713 <- spe_713[,colData(spe_713)$in_tissue == 1]
+dim(spe_713) 
+
+# identify mitochondrial genes
+is_mito <- grepl("(^MT-)|(^Mt-)|(^mt-)", rowData(spe_713)$symbol)
+table(is_mito)
+rowData(spe_713)$symbol[is_mito]
+
+# calculate per-spot QC metrics and store in colData
+spe_713 <- addPerCellQC(spe_713, subsets = list(mito = is_mito))
+head(colData(spe_713))
+```
+
+```{r, fig.cap="Histograms of QC metrics."}
+par(mfrow = c(1, 3))
+hist(colData(spe_713)$sum, xlab = "sum", main = "UMIs per spot")
+hist(colData(spe_713)$detected, xlab = "detected", main = "Genes per spot")
+hist(colData(spe_713)$subsets_mito_percent, xlab = "percent mitochondrial", main = "Percent mito UMIs", xlim=range(0,100))
+```
+
+:::
+
+::: {.panel}
+
+## Remove low-quality spots
+
+There are hundreds of spots identified as QC outliers due to high mitochondrial content, but they appear to mostly be in the areas with high UMI counts so a lot of data will be lost after QC.
+
+```{r}
+# identify outliers based on QC metrics
+qc <- perCellQCFilters(spe_713, sub.fields="subsets_mito_percent")
+colSums(as.matrix(qc))
+colData(spe_713)$discard <- qc$discard
+
+# visualise spots to be discarded - check that there are no obvious (potentially bioliogically meaningful) spatial patterns
+plotQC(spe_713, type = "spots", discard = "discard")
+
+# remove low quality spots
+spe_713 <- spe_713[, !colData(spe_713)$discard]
+dim(spe_713)
+
+# remove same spots from Seurat object
+seu_713 <- subset(seu_713, cells= colnames(spe_713))
+```
+
+```{r, fig.cap="Histograms of QC metrics after filtering."}
+umi_violin <- ggpubr::ggviolin(colData(spe_713)$sum,color = "black", fill = "#B7DE88") + geom_jitter(shape=16, position=position_jitter(),colour="grey35") +
+  labs(title="UMIs per spot",x="713",y="counts") +
+  ylim(0,100000)
+genes_detected <- hist(colData(spe_713)$detected, xlab = "detected", main = "Genes detected per spot", col="#F1A77B",xlim=c(1000,10000))
+mito_content <- hist(colData(spe_713)$subsets_mito_percent, xlab = "% mitochondrial", main = "Mitochondrial content per spot", xlim=range(0,5), col="#B3E8EA")
+
+par(mfrow = c(1, 3))
+umi_violin
+genes_detected
+mito_content
+```
+
+:::
+
+:::::
+
+# Normalisation
+
+We apply methods from `scater` and `scran` developed for scRNA-seq data, assuming each spot can be treated as one cell.
+
+```{r}
+# calculate library size factors and store in object
+spe_713 <- computeLibraryFactors(spe_713)
+summary(sizeFactors(spe_713))
+```
+
+```{r, fig.cap="Histogram of size factors."}
+hist(sizeFactors(spe_713), breaks = 20)
+```
+
+```{r}
+# calculate logcounts (log-transformed normalized counts) and store in object
+spe_713 <- logNormCounts(spe_713)
+
+# check
+assayNames(spe_713)
+
+dim(counts(spe_713))
+dim(logcounts(spe_713))
+# saveRDS(spe_713, here("analysis","output","RDS","spe_713_FFPE_CA_norm.RDS"))
+```
+
+# Feature selection
+
+Here we apply feature selection methods from `scran` to identify highly variable genes (HVGs) or spatially variable genes (SVGs), which can then be investigated individually or used as the input for further downstream analyses.
+
+## HVGs
+
+Purely defined on molecular features i.e. gene expression and do not take any spatial information into account/the biologically meaningful spatial information mainly reflects spatial distributions of major cell types.
+
+```{r}
+# remove mitochondrial genes
+# spe_713 <- spe_713[!is_mito, ]
+dim(spe_713)
+
+# fit mean-variance relationship
+dec <- modelGeneVar(spe_713)
+
+# visualise mean-variance relationship
+fit <- metadata(dec)
+plot(fit$mean, 
+     fit$var,
+     xlab = "mean of log-expression", ylab = "variance of log-expression")
+curve(fit$trend(x), col = "dodgerblue", add = TRUE, lwd = 2)
+
+# select top HVGs
+top_hvgs <- getTopHVGs(dec, prop = 0.1) # report 10% of the top HVGs
+# gene_symbol <- mapIds(Mus.musculus, keys = top_hvgs, keytype = "ENSEMBL", column="SYMBOL") %>% as.data.frame()
+top_genes <- data.frame(dec[top_hvgs,])
+# write.csv(top_genes, file=here("analysis","output","HVGs","713_FFPE_CA_top_HVGs.csv"))
+nrow(top_genes)
+head(top_genes)
+```
+
+# Dimensionality reduction
+
+## PCA
+
+We apply principal component analysis (PCA) provided in `scater` to the set of top HVGs to reduce the dimensionality of the dataset, retaining the top 50 principal components (PCs) for further downstream analyses. This is done to:
+
+* reduce noise due to random variation in expression of biologically uninteresting genes, which are assumed to have expression patterns independent of each other
+* improve computational efficiency during downstream analyses.
+
+```{r}
+set.seed(111111)
+spe_713 <- scater::runPCA(spe_713, subset_row = top_hvgs)
+
+reducedDimNames(spe_713)
+dim(reducedDim(spe_713, "PCA"))
+```
+
+## UMAP
+
+We also run uniform manifold approximation and projection (UMAP) on the set of top 50 PCs and retain the top 2 UMAP components for visualisation.
+
+```{r}
+set.seed(111112)
+spe_713 <- scater::runUMAP(spe_713, dimred = "PCA")
+
+reducedDimNames(spe_713)
+dim(reducedDim(spe_713, "UMAP"))
+
+# update column names for easier plotting
+colnames(reducedDim(spe_713, "UMAP")) <- paste0("UMAP", 1:2)
+```
+
+## Visualisation
+
+```{r, fig.cap="The top 2 PCA dimensions."}
+plotDimRed(spe_713, type = "PCA")
+```
+
+```{r, fig.cap="The top 2 UMAP dimensions."}
+plotDimRed(spe_713, type = "UMAP")
+```
+
+# Clustering
+
+Used to identify cell types and subtypes, which can be defined at various resolutions depending on biological context; the desired number of clusters also depends on biological context. In the spatial context, we may be interested in e.g. identifying cell types or subtypes occurring in biologically interesting spatial patterns.
+
+We apply **graph-based clustering** using the Walktrap method implemented in `scran` to the top 50 PCs calculated on the set of top HVGs. By default, the 10 nearest neighbors of each cell are used to construct a shared nearest neighbor graph. Two cells are connected by an edge if any of their nearest neighbors are shared, with the edge weight defined from the highest average rank of the shared neighbors (Xu and Su 2015). We assume here that biologically informative spatial distribution patterns of cell types can be detected from the molecular features (gene expression). 
+
+```{r}
+set.seed(111113)
+k <- 10 # default number of nearest neighbours
+g <- buildSNNGraph(spe_713, k, use.dimred = "PCA")
+g_walk <- igraph::cluster_walktrap(g)
+clus <- g_walk$membership
+table(clus)
+
+# store cluster labels in column 'label' in colData
+colLabels(spe_713) <- factor(clus)
+```
+
+Visualise the clusters by plotting in:
+
+1. Spatial coordinates
+
+```{r, fig.cap="Clusters in spatial (x-y) coordinates on the tissue slide."}
+plotSpots(spe_713, annotate = "label", palette = brewer.pal(11, "Paired"), size = 1.5)
+```
+
+
+2. Reduced dimensions
+
+```{r, fig.cap="Clusters in PCA-reduced dimensions."}
+plotDimRed(spe_713, type = "PCA", annotate = "label", palette = brewer.pal(11, "Paired"), size = 1)
+```
+
+```{r, fig.cap="Clusters in UMAP-reduced dimensions."}
+umap_713 <- plotDimRed(spe_713, type = "UMAP", annotate = "label", palette = brewer.pal(11, "Paired"), size = 1)
+umap_713
+```
+
+# Marker genes
+
+We use `findMarkers` from `scran` which uses a binomial test to find candidate marker genes for groups of cells (e.g., clusters) by testing for differential expression between pairs of groups.
+
+```{r}
+# set gene names as row names for easier plotting
+rownames(spe_713) <- rowData(spe_713)$symbol
+
+# test for marker genes - we show here only genes upregulated
+markers <- findMarkers(spe_713, test = "binom", direction = "up")
+```
+
+```{r}
+cluster <- names(markers)
+hm <- function(cluster) {
+  interesting <- markers[[cluster]]
+  # write markers to file
+  write.csv(interesting, here(
+    "analysis",
+    "output",
+    "marker_genes",
+    "all_clusters",
+    paste0("713_FFPE_CA_cluster_", cluster, ".uniquely_up.csv")))
+  # plot log-fold changes for one cluster over all other clusters
+  best_set <- interesting[interesting$Top <= 5, ]
+  logFCs <- getMarkerEffects(best_set)
+  logFCs
+  pheatmap(logFCs, breaks = seq(-5, 5, length.out = 101))
+}
+  # plot log-transformed normalized expression of top genes for one cluster
+ep <- function(cluster) {
+  interesting <- markers[[cluster]]
+  top_genes <- head(rownames(interesting))
+  plotExpression(spe_713, x = "label", features = top_genes)
+}
+
+template <- c(
+  "::: {.panel}\n\n",
+  "## Cluster {{hm}}\n",
+  "```{r cluster-{{hm}}, fig.asp = 1.1, fig.cap = c('Heatmap of log-fold changes for cluster `{{hm}}` over all other clusters.', 'Violin plots (grouped by cluster) showing log-transformed normalised expression values of top genes of cluster `{{hm}}`.')}\n",
+  "hm('{{hm}}')\n",
+  "ep('{{hm}}')\n",
+  "```",
+  "\n\n:::"
+)
+
+hm_list <- list(
+  "::::: {.panelset}",
+  lapply(cluster, function(hm) {
+    knitr::knit_expand(text = template)
+  }), 
+  ":::::")
+```
+
+`r knitr::knit(text = unlist(hm_list))`
+
+
+### Top marker gene of each cluster
+
+```{r, fig.cap="Clusters in spatial (x-y) coordinates on the tissue slide."}
+plotSpots(spe_713, annotate = "label", palette = brewer.pal(11, "Paired"), size = 1.5)
+```
+
+
+```{r, fig.asp=1.5,fig.cap="Spatially resolved expression of the top marker gene of each cluster."}
+top_gene <- NULL
+for (i in 1:length(cluster)) {
+  top_gene <- c(top_gene,rownames(markers[[i]])[1])
+}
+top_gene
+SpatialFeaturePlot(object = seu_713, features = top_gene, ncol = 3, image.alpha=0.35, pt.size.factor=2)
+```
+
+# Session info {.appendix}
+
+The analysis and this document were prepared using the following software:
+
+<details>
+
+```{r}
+devtools::session_info()
+```
+
+</details>
+**Bioconductor version**: `r BiocManager::version()`
+
+
+
+
+
+
