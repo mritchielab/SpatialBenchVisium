@@ -18,7 +18,7 @@ Please cite our paper if you use our data and/or scripts in your studies.
 
 ## Index
 
-Download the `site` folder and open `index.html` to view HTML reports as a website. Code to produce the reports are stored as Rmarkdown documents in `analysis`. Plots and objects are saved in `output`.
+Code to produce the reports are stored as Rmarkdown documents in `analysis`. Objects are saved in `output`.
 
 ### Pre-processing
 
