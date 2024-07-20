@@ -7,12 +7,12 @@ intersect_spe_rows <- function(samples_tb) {
 }
 
 combine_spe <- function(samples_tb) {
-  sapply(samples_tb$spe, function(spe) {
-    spe$sample_id <- metadata(spe)$sample
+  mapply(function(spe, sample_id) {
+    spe$sample_id <- sample_id
     rowData(spe) <- rowData(spe)[, c("symbol", "EnsembleID")]
-    colnames(spe) <- paste0(gsub("-1$", "-", colnames(spe)), metadata(spe)$sample)
+    colnames(spe) <- paste0(gsub("-1$", "-", colnames(spe)), sample_id)
     return(spe)
-  }) %>%
+  }, samples_tb$spe, samples_tb$sample) %>%
     do.call(cbind, .)
 }
 
@@ -26,6 +26,9 @@ get_cluster_label <- function(
     factor()
 }
 
+# https://github.com/XiaoZhangryy/iSC.MEB/issues/2
+# install_version("SeuratObject", version = "4.1.4")
+# install_version("Seurat", version = "4.4.0")
 run_iSC_MEB <- function(
     seu_list, customGenelist, k, n_pca = 10, maxIter = 20) {
   iSC.MEB::CreateiSCMEBObject(seu_list, customGenelist = customGenelist) |>

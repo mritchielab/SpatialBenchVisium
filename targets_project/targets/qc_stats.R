@@ -1,10 +1,11 @@
 list(
-  tar_target(
-    all_samples,
-    load_samples_tb(sample_name_func = function(x) {
-      gsub("^[^_]+_", "", x$folder)
-    })
-  ),
+  # tar_target(
+  #   all_samples,
+  #   load_samples_tb(sample_name_func = function(x) {
+  #     gsub("^[^_]+_", "", x$folder)
+  #   })
+  # ),
+  tar_target(all_samples, qs::qread("data/all_samples.qs")),
   tar_target(
     umi_counts,
     all_samples |>
@@ -143,7 +144,7 @@ list(
             labels = c("OCT CA", "FFPE CA")
           ),
           ncol = 1, vjust = 1, hjust = 0,
-          labels = c("FFPE Experiment 1 (WT)", "OCT Experiment 2 (KO & CTRL)", "OCT Experiment 2 (WT)", "FFPE Experiment 3 (WT)", "CA Experiment 4 (WT)")
+          labels = c("FFPE manual (earlier)", "OCT manual (KO vs CTRL)", "OCT manual (WT)", "FFPE manual (later)", "CA")
         )
 
         cowplot::save_plot(
@@ -152,5 +153,69 @@ list(
         )
         return(file.path("output", "umi.pdf"))
       })()
+  ),
+
+  # MDS
+  tar_target(samples_mds, format = 'file',
+    {
+      mei_path <- "/vast/scratch/users/wang.ch/tmp/SpatialBench"
+      svgs <- Reduce(intersect, 
+        list(
+          readRDS(file.path(mei_path, "output", "FF_SVGs_sig.RDS"))$gene_name[1:1000],
+          readRDS(file.path(mei_path, "output", "FFPE_SVGs_sig.RDS"))$gene_name[1:1000],
+          readRDS(file.path(mei_path, "output", "FF_CA_SVGs_sig.RDS"))$gene_name[1:1000],
+          readRDS(file.path(mei_path, "output", "FFPE_CA_SVGs_sig.RDS"))$gene_name[1:1000]
+        )
+      )
+      spes <- scuttleFilter(filter(all_samples, experiment != 'Pilot study'))$spe
+      spes <- lapply(spes, \(x) {rownames(x) <- rowData(x)$symbol; x[svgs, ]})
+      bulkCounts <- do.call(cbind, lapply(spes, \(x) rowSums(counts(x))))
+      mds <- edgeR::DGEList(
+          counts = bulkCounts,
+          samples = colnames(bulkCounts),
+      ) |>
+        edgeR::calcNormFactors() |>
+        limma::plotMDS(plot = FALSE)
+      tb <- tibble(
+        x = mds$x,
+        y = mds$y,
+        experiment = dplyr::filter(all_samples, experiment != 'Pilot study')$experiment,
+        sample = colnames(bulkCounts),
+        group = dplyr::filter(all_samples, experiment != 'Pilot study')$group
+      ) |>
+        mutate(experiment = case_when(
+          experiment == "FFPE Experiment 1" ~ "FFPE manual (earlier)",
+          experiment == "FFPE Experiment 3" ~ "FFPE manual (later)",
+          experiment == "CA Experiment 4" ~ "CytAssist",
+          experiment == "OCT Experiment 2" & group == "WT OCT" ~ "OCT manual (WT)",
+          experiment == "OCT Experiment 2" & group != "WT OCT" ~ "OCT manual (KOvsCTRL)"
+        ), protocol = case_when(
+          grepl("FFPE manual", experiment) ~ "FFPE manual",
+          grepl("OCT manual", experiment) ~ "OCT manual",
+          grepl("CytAssist_OCT", sample) ~ "OCT CA",
+          grepl("CytAssist_FFPE", sample) ~ "FFPE CA"
+        )) |>
+        mutate(experiment = factor(experiment, levels = c("FFPE manual (earlier)", "OCT manual (KOvsCTRL)", "OCT manual (WT)","FFPE manual (later)", "CytAssist")),
+               protocol = factor(protocol, levels = c("OCT manual","FFPE manual","OCT CA", "FFPE CA")),
+          sample = stringr::str_extract(sample, "[0-9]{3}")
+        )
+
+      p <- ggpubr::ggscatter(tb, x="x", y="y",
+        color = "experiment", palette = "jama",
+        shape = "protocol",  label="sample", repel=TRUE,
+        font.label=c(5,"plain"),
+        xlab = sprintf("MDS1 (%.2f%%)", mds$var.explained[1]*100),
+        ylab = sprintf("MDS2 (%.2f%%)", mds$var.explained[2]*100)) +
+        theme(legend.position= c(0.68,0.95),
+          legend.justification = c("left","top"),
+          legend.margin = margin(0, 0, 0, 0),
+          legend.box = "horizontal",legend.text = element_text(size=7),
+          legend.title=element_text(size=7),
+          axis.title = element_text(face="bold", size=5),
+          axis.text=element_text(size=5))
+      
+      ggsave(file.path("output", "mds_samples.pdf"), p, width = 8.5, height = 6.5)
+      return(file.path("output", "mds_samples.pdf"))
+    }
   )
 )

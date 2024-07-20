@@ -178,7 +178,7 @@ to_seu <- function(spe) {
   return(s)
 }
 
-run_nnSVG <- function(spe_list) {
+run_nnSVG <- function(spe_list, filter_genes_ncounts = 3, filter_genes_pcspots = 0.5) {
   sample_ids <- names(spe_list)
   stopifnot(all(sapply(spe_list, \(x) "symbol" %in% colnames(SummarizedExperiment::rowData(x)))))
 
@@ -186,8 +186,8 @@ run_nnSVG <- function(spe_list) {
     SummarizedExperiment::rowData(spe)$gene_name <- SummarizedExperiment::rowData(spe)$symbol
     spe <- nnSVG::filter_genes(
       spe,
-      filter_genes_ncounts = 3,
-      filter_genes_pcspots = 0.5,
+      filter_genes_ncounts = filter_genes_ncounts,
+      filter_genes_pcspots = filter_genes_pcspots,
       filter_mito = TRUE
     )
     spe <- spe[, colSums(SingleCellExperiment::counts(spe)) > 0] |>

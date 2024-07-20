@@ -1,18 +1,9 @@
 #  WT vs CTRL
 list(
-  tar_target(sample_ids_file, "data/sample_ids.tsv", format = "file"),
-  tar_target(
-    spes_wt_ctrl_tb,
-    sample_ids_file |>
-      load_samples_tb(
-        filter_func = delay_filter(
-          experiment == "OCT Experiment 2" & group != "KO OCT"
-        ),
-        sample_name_func =
-          function(x) {
-            gsub(".*_", "", x$folder)
-          }
-      ) |>
+  tar_target(spes_wt_ctrl_tb, 
+    all_samples |>
+      filter(experiment == "OCT Experiment 2" & group != "KO OCT") |> 
+      mutate(sample = gsub(".*_", "", folder)) |>
       scuttleFilter(feature_discard_func = function(x) {
         FALSE
       })
@@ -59,12 +50,17 @@ list(
         return(x)
       })()
   ),
-  tar_target(nnSVG_wtctrl, run_nnSVG(spes_wt_ctrl_tb$spe)),
-  tar_target(
-    iSCMEB_wtctrl,
-    spes_wt_ctrl_tb$spe |>
-      sapply(to_seu) |>
-      run_iSC_MEB(customGenelist = filter_nnSVG(nnSVG_wtctrl), k = 8)
+  tar_target(iSCMEB_wtctrl, 
+    {
+      set.seed(123)
+      if (file.exists('output/iSCMEB_wtctrl.qs')) {
+        qs::qread('output/iSCMEB_wtctrl.qs')
+      } else {
+        spes_wt_ctrl_tb$spe |>
+          sapply(to_seu) |>
+          run_iSC_MEB(customGenelist = filter_nnSVG(run_nnSVG(spes_wt_ctrl_tb$spe)), k = 8)
+      }
+    }
   ),
   tar_target(
     cluster_wtctrl,
@@ -84,8 +80,8 @@ list(
           legend.title = element_text(size = 20)
         ) +
         guides(color = guide_legend(override.aes = list(size = 4)))
-      ggsave(file.path("output", "WT_CTL_UMAP.jpg"), p, width = 15, height = 12, dpi = 600, units = "cm")
-      file.path("output", "WT_CTL_UMAP.jpg")
+      ggsave(file.path("output", "WT_CTL_UMAP.pdf"), p, width = 15, height = 12, dpi = 600, units = "cm")
+      file.path("output", "WT_CTL_UMAP.pdf")
     }
   ),
   tar_target(
@@ -139,8 +135,8 @@ list(
         ggtitle("Female")
 
       p <- ((p1 + guides(color = "none")) / p2) + plot_layout(guides = "collect")
-      ggsave(file.path("output", "WT_CTL_zone_plot.jpg"), p, width = 30, height = 17.5, dpi = 600, units = "cm")
-      file.path("output", "WT_CTL_zone_plot.jpg")
+      ggsave(file.path("output", "WT_CTL_zone_plot.pdf"), p, width = 30, height = 17.5, dpi = 600, units = "cm")
+      file.path("output", "WT_CTL_zone_plot.pdf")
     }
   ),
   tar_target(
@@ -194,8 +190,8 @@ list(
         ggtitle("Female")
 
       p <- ((p1 + guides(color = "none")) / p2) + plot_layout(guides = "collect")
-      ggsave(file.path("output", "WT_CTL_cluster_plot.jpg"), p, width = 30, height = 17.5, dpi = 600, units = "cm")
-      file.path("output", "WT_CTL_cluster_plot.jpg")
+      ggsave(file.path("output", "WT_CTL_cluster_plot.pdf"), p, width = 30, height = 17.5, dpi = 600, units = "cm")
+      file.path("output", "WT_CTL_cluster_plot.pdf")
     }
   ),
 
@@ -220,7 +216,7 @@ list(
     ) |>
     na.omit()),
   tar_target(mei_palette, RColorBrewer::brewer.pal(6, "Set2")[c(1, 3, 5, 4, 6, 2)] |>
-    setNames(c("B cell", "Germinal centre", "Neutrophil", "Red pulp", "Plasma cell", "T cell"))),
+    setNames(c("B cell", "Germinal centre", "Neutrophil", "Erythrocyte", "Plasma cell", "T cell"))),
   tar_target(
     heatmap_wtctrl,
     format = "file",
@@ -244,8 +240,8 @@ list(
         geom_text(aes(label = format(round(logfc, digits = 1), nsmall = 1)), color = "black", size = 4) +
         scale_fill_distiller(palette = "RdBu") +
         coord_fixed()
-      ggsave(file.path("output", "WT_CTL_heatmap.jpg"), p, width = 15, height = 15, dpi = 600, units = "cm")
-      file.path("output", "WT_CTL_heatmap.jpg")
+      ggsave(file.path("output", "WT_CTL_heatmap.pdf"), p, width = 15, height = 15, dpi = 600, units = "cm")
+      file.path("output", "WT_CTL_heatmap.pdf")
     }
   ),
 
@@ -264,12 +260,12 @@ list(
     (\(x) {
       x$zone <- factor(
         case_when(
-          x == 1 ~ "Red pulp",
-          x == 2 ~ "B cell",
-          x == 3 ~ "Neutrophil",
-          x == 4 ~ "Red pulp",
-          x == 5 ~ "Red pulp",
-          x == 6 ~ "Germinal centre",
+          x == 1 ~ "Neutrophil",
+          x == 2 ~ "Germinal centre",
+          x == 3 ~ "Erythrocyte",
+          x == 4 ~ "Erythrocyte",
+          x == 5 ~ "B cell",
+          x == 6 ~ "Erythrocyte",
           x == 7 ~ "Plasma cell",
           x == 8 ~ "T cell"
         )
@@ -369,9 +365,9 @@ list(
   tar_target(WT_CTL_sex_MAplot_all,
     format = "file",
     efits_wtctrl |>
-      subset(names(efits_wtctrl) != "B Cell follicle") |>
+      subset(names(efits_wtctrl) != "B cell") |>
       (\(efits) {
-        jpeg(file.path("output", "WT_CTL_sex_MAplot.jpg"), width = 25, height = 40, res = 600, units = "cm")
+        pdf(file.path("output", "WT_CTL_sex_MAplot.pdf"), width = 10, height = 16)
         par(mfrow = c(3, 2))
         for (efit in efits) {
           chr <- efit$gene$chromosome_name
@@ -389,16 +385,16 @@ list(
           )
         }
         dev.off()
-        return(file.path("output", "WT_CTL_sex_MAplot.jpg"))
+        return(file.path("output", "WT_CTL_sex_MAplot.pdf"))
       })()
   ),
   tar_target(
     WT_CTL_sex_barcodeplot_all,
     format = "file",
     efits_wtctrl |>
-      subset(names(efits_wtctrl) != "B Cell follicle") |>
+      subset(names(efits_wtctrl) != "B cell") |>
       (\(efits) {
-        jpeg(file.path("output", "WT_CTL_sex_barcodeplot.jpg"), width = 35, height = 40, res = 600, units = "cm")
+        pdf(file.path("output", "WT_CTL_sex_barcodeplot.pdf"), width = 14, height = 16)
         par(mfrow = c(3, 2))
         for (efit in efits) {
           chr <- efit$gene$chromosome_name
@@ -413,7 +409,7 @@ list(
           )
         }
         dev.off()
-        return(file.path("output", "WT_CTL_sex_barcodeplot.jpg"))
+        return(file.path("output", "WT_CTL_sex_barcodeplot.pdf"))
       })()
   ),
 
@@ -421,7 +417,7 @@ list(
   tar_target(WT_CTL_sex_MAplot,
     format = "file",
     (\(efit) {
-      file_name <- paste0(file.path("output", "WT_CTL_sex_MAplot_"), gsub(" ", "_", efit$cluster), ".jpg")
+      file_name <- paste0(file.path("output", "WT_CTL_sex_MAplot_"), gsub(" ", "_", efit$cluster), ".pdf")
       chr <- efit$gene$chromosome_name
       chr <- ifelse(efit$gene$symbol %in% xie_genes, "XiE", chr)
       chr[!chr %in% c("XiE", "Y")] <- "Other"
@@ -429,7 +425,7 @@ list(
         levels = c("XiE", "Y", "Other"),
         labels = c("XiE gene", "chrY gene", "Other")
       )
-      jpeg(file_name, width = 20, height = 20, res = 600, units = "cm")
+      pdf(file_name, width = 8, height = 8)
       limma::plotMA(efit,
         status = chr,
         coef = "MalevsFemale",
@@ -446,14 +442,14 @@ list(
   tar_target(WT_CTL_sex_barcodeplot,
     format = "file",
     (\(efit) {
-      file_name <- paste0(file.path("output", "WT_CTL_sex_barcodeplot_"), gsub(" ", "_", efit$cluster), ".jpg")
+      file_name <- paste0(file.path("output", "WT_CTL_sex_barcodeplot_"), gsub(" ", "_", efit$cluster), ".pdf")
       chr <- efit$gene$chromosome_name
       chr <- ifelse(efit$gene$symbol %in% xie_genes, "XiE", chr)
       chr[!chr %in% c("XiE", "Y")] <- "Other"
       chr <- factor(chr,
         levels = c("XiE", "Y", "Other")
       )
-      jpeg(file_name, width = 22, height = 22, res = 600, units = "cm")
+      pdf(file_name, width = 9, height = 9)
       barcodeplot(efit$t[, "MalevsFemale"],
         index = chr == "Y", index2 = chr == "XiE",
         main = paste0("Barcode plot of sex-specific genes in Male vs. Female ", efit$cluster, " DE analysis")

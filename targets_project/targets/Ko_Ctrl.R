@@ -1,16 +1,9 @@
 list(
   tar_target(
     spes_koctrl_tb,
-    sample_ids_file |>
-      load_samples_tb(
-        filter_func = delay_filter(
-          experiment == "OCT Experiment 2" & group != "WT OCT"
-        ),
-        sample_name_func =
-          function(x) {
-            gsub(".*_", "", x$folder)
-          }
-      ) |>
+    all_samples |>
+      filter(experiment == "OCT Experiment 2" & group != "WT OCT") |>
+      mutate(sample = gsub(".*_", "", folder)) |>
       scuttleFilter(feature_discard_func = function(x) {
         FALSE
       })
@@ -57,12 +50,17 @@ list(
         return(x)
       })()
   ),
-  tar_target(nnSVG_koctrl, run_nnSVG(spes_koctrl_tb$spe)),
-  tar_target(
-    iSCMEB_koctrl,
-    spes_koctrl_tb$spe |>
-      sapply(to_seu) |>
-      run_iSC_MEB(customGenelist = filter_nnSVG(nnSVG_koctrl), k = 8)
+  tar_target(iSCMEB_koctrl, 
+    {
+      set.seed(123)
+      if (file.exists('output/iSCMEB_koctrl.qs')) {
+        qs::qread('output/iSCMEB_koctrl.qs')
+      } else {
+        spes_koctrl_tb$spe |>
+          sapply(to_seu) |>
+          run_iSC_MEB(customGenelist = filter_nnSVG(run_nnSVG(spes_koctrl_tb$spe)), k = 8)
+      }
+    }
   ),
   tar_target(
     cluster_koctrl,
@@ -82,8 +80,8 @@ list(
           legend.title = element_text(size = 20)
         ) +
         guides(color = guide_legend(override.aes = list(size = 4)))
-      ggsave(file.path("output", "KO_CTL_UMAP.jpg"), p, width = 12, height = 12, dpi = 600, units = "cm")
-      file.path("output", "KO_CTL_UMAP.jpg")
+      ggsave(file.path("output", "KO_CTL_UMAP.pdf"), p, width = 12, height = 12, dpi = 600, units = "cm")
+      file.path("output", "KO_CTL_UMAP.pdf")
     }
   ),
   tar_target(
@@ -136,8 +134,8 @@ list(
         ggtitle("CTL")
 
       p <- (p1 + guides(color = "none") | p2) + plot_layout(guides = "collect")
-      ggsave(file.path("output", "KO_CTL_cluster_plot.jpg"), p, width = 15, height = 10, dpi = 600, units = "cm")
-      file.path("output", "KO_CTL_cluster_plot.jpg")
+      ggsave(file.path("output", "KO_CTL_cluster_plot.pdf"), p, width = 15, height = 10, dpi = 600, units = "cm")
+      file.path("output", "KO_CTL_cluster_plot.pdf")
     }
   ),
   tar_target(
@@ -191,8 +189,8 @@ list(
         ggtitle("CTL")
 
       p <- (p1 + guides(color = "none") | p2) + plot_layout(guides = "collect")
-      ggsave(file.path("output", "KO_CTL_zone_plot.jpg"), p, width = 15, height = 10, dpi = 600, units = "cm")
-      file.path("output", "KO_CTL_zone_plot.jpg")
+      ggsave(file.path("output", "KO_CTL_zone_plot.pdf"), p, width = 15, height = 10, dpi = 600, units = "cm")
+      file.path("output", "KO_CTL_zone_plot.pdf")
     }
   ),
   tar_target(
@@ -218,8 +216,8 @@ list(
         geom_text(aes(label = format(round(logfc, digits = 1), nsmall = 1)), color = "black", size = 4) +
         scale_fill_distiller(palette = "RdBu") +
         coord_fixed()
-      ggsave(file.path("output", "KO_CTL_heatmap.jpg"), p, width = 15, height = 15, dpi = 600, units = "cm")
-      file.path("output", "KO_CTL_heatmap.jpg")
+      ggsave(file.path("output", "KO_CTL_heatmap.pdf"), p, width = 15, height = 15, dpi = 600, units = "cm")
+      file.path("output", "KO_CTL_heatmap.pdf")
     }
   ),
   # manual annotation for cluster
@@ -227,13 +225,13 @@ list(
     (\(x) {
       x$zone <- factor(
         case_when(
-          x == 1 ~ "Red pulp",
-          x == 2 ~ "Red pulp",
-          x == 3 ~ "Red pulp",
-          x == 4 ~ "B cell",
-          x == 5 ~ "T cell",
-          x == 6 ~ "Plasma cell",
-          x == 7 ~ "Neutrophil",
+          x == 1 ~ "B cell",
+          x == 2 ~ "Erythrocyte",
+          x == 3 ~ "Neutrophil",
+          x == 4 ~ "Erythrocyte",
+          x == 5 ~ "Plasma cell",
+          x == 6 ~ "Erythrocyte",
+          x == 7 ~ "T cell",
           x == 8 ~ "Germinal centre"
         )
       )
@@ -337,17 +335,47 @@ list(
     (\(efit) {
       file_name <- paste0(file.path("output", "koctrl_"), gsub(" ", "_", efit$cluster), "_DE_genes.csv")
       limma::topTable(efit, number = Inf, p.value = 0.05) |>
+        mutate(Overlap_Ly_et_al = symbol %in% prev_de$Symbol) |>
         write_csv(file_name)
       return(file_name)
     })(efits_koctrl[[1]]),
     pattern = map(efits_koctrl),
     iteration = "list"
   ),
+  tar_target(KO_CTL_MAplot_Bcell,
+    format = "file",
+    efits_koctrl[["B cell"]] |>
+      (\(efit) {
+        pdf(file.path("output", "KO_CTL_MAplot_Bcell.pdf"), width = 6, height = 5)
+        status <- efit$genes |>
+          dplyr::left_join(prev_de, by = c("symbol" = "Symbol")) |>
+          mutate(status = case_when(
+            is.na(logFC) ~ "Other",
+            symbol == "Tbx21" ~ "T-bet",
+            logFC > 0 ~ "T-bet up-regulated",
+            logFC < 0 ~ "T-bet down-regulated"
+          )) |>
+          dplyr::pull(status) |>
+          factor()
+        limma::plotMA(efit,
+          status = status,
+          main = paste0("KO vs. CTL MA plot of ", efit$cluster, " DE analysis"),
+          values = c("T-bet up-regulated", "T-bet down-regulated", "T-bet"),
+          hl.col = c("red", "blue", "blue"),
+          hl.pch = c(16, 16, 17),
+          hl.cex = c(0.7, 0.7, 1),
+          legend = FALSE
+        )
+        dev.off()
+        return(file.path("output", "KO_CTL_MAplot_Bcell.pdf"))
+      })()
+  ),
   tar_target(KO_CTL_MAplot_all,
     format = "file",
     efits_koctrl |>
+      subset(names(efits_koctrl) != "B cell") |>
       (\(efits) {
-        jpeg(file.path("output", "KO_CTL_MAplot.jpg"), width = 25, height = 40, res = 600, units = "cm")
+        pdf(file.path("output", "KO_CTL_MAplot.pdf"), width = 10, height = 16)
         par(mfrow = c(3, 2))
         for (efit in efits) {
           status <- efit$genes |>
@@ -370,15 +398,16 @@ list(
           )
         }
         dev.off()
-        return(file.path("output", "KO_CTL_MAplot.jpg"))
+        return(file.path("output", "KO_CTL_MAplot.pdf"))
       })()
   ),
   tar_target(
     KO_CTL_barcodeplot_all,
     format = "file",
     efits_koctrl |>
+      subset(names(efits_koctrl) != "B cell") |>
       (\(efits) {
-        jpeg(file.path("output", "KO_CTL_barcodeplot.jpg"), width = 35, height = 40, res = 600, units = "cm")
+        pdf(file.path("output", "KO_CTL_barcodeplot.pdf"), width = 14, height = 16)
         par(mfrow = c(3, 2))
         for (efit in efits) {
           status <- efit$genes |>
@@ -398,7 +427,144 @@ list(
           )
         }
         dev.off()
-        return(file.path("output", "KO_CTL_barcodeplot.jpg"))
+        return(file.path("output", "KO_CTL_barcodeplot.pdf"))
       })()
+  ),
+  tar_target(
+    KO_CTL_barcodeplot_Bcell,
+    format = "file",
+    efits_koctrl[["B cell"]] |>
+      (\(efit) {
+        pdf(file.path("output", "KO_CTL_barcodeplot_Bcell.pdf"), width = 7, height = 5)
+        status <- efit$genes |>
+          dplyr::left_join(prev_de, by = c("symbol" = "Symbol")) |>
+          mutate(
+            status = case_when(
+              is.na(logFC) ~ "Other",
+              logFC > 0 ~ "T-bet up-regulated",
+              logFC < 0 ~ "T-bet down-regulated"
+            )
+          ) |>
+          dplyr::pull(status) |>
+          factor(levels = c("T-bet up-regulated", "T-bet down-regulated", "Other"))
+        barcodeplot(efit$t[, "Kovsctrl"],
+          index = status == "T-bet up-regulated", index2 = status == "T-bet down-regulated",
+          main = paste0("Barcode plot of T-bet signature genes in KO vs. CTL ", efit$cluster, " DE analysis"),
+        )
+        dev.off()
+        return(file.path("output", "KO_CTL_barcodeplot_Bcell.pdf"))
+      })()
+  ),
+
+  # enrichment analysis
+  ## GO
+  tar_map(
+    values = tibble::tibble(
+      ont = c("BP", "MF", "CC")
+    ), names = "ont",
+    tar_target(go_koctrl,
+      sapply(
+        efits_koctrl,
+        function(efit) {
+          limma::topTable(efit, number = Inf, p.value = 0.05) |>
+          filter(!symbol %in% prev_de$Symbol) |>
+          rownames() |>
+          my_enrichGO(key_type = "ensembl_gene_id", ont = ont)
+        }
+      )
+    ),
+    tar_target(go_dotplot_koctrl,
+      format = "file",
+      go_koctrl |>
+        (\(gos) {
+          pdf(file.path("output", paste0("KO_CTL_GO_", ont, "_dotplot.pdf")), width = 10, height = 16)
+          for (i in names(gos)) {
+            if (nrow(head(gos[[i]])) == 0) {
+              next
+            }
+            clusterProfiler::dotplot(gos[[i]],
+              title = paste0("KO vs. CTL ", i, " GO ", ont, " enrichment")
+            ) |>
+              plot()
+          }
+          dev.off()
+          return(file.path("output", paste0("KO_CTL_GO_", ont, "_dotplot.pdf")))
+        })()
+    ),
+    tar_target(go_goplot_koctrl,
+      format = "file",
+      go_koctrl |>
+        (\(gos) {
+          pdf(file.path("output", paste0("KO_CTL_GO_", ont, "_goplot.pdf")), width = 25, height = 16)
+          par(mfrow = c(3, 2))
+          for (i in names(gos)) {
+            if (nrow(head(gos[[i]])) == 0) {
+              next
+            }
+            plot(clusterProfiler::goplot(gos[[i]]) + 
+            ggtitle(paste0("KO vs. CTL ", i, " GO ", ont, " enrichment")))
+          }
+          dev.off()
+          return(file.path("output", paste0("KO_CTL_GO_", ont, "_goplot.pdf")))
+        })()
+    ),
+    tar_target(go_koctrl_results,
+      format = "file",
+      {
+        go_koctrl |>
+          lapply(function(x) {
+            x@result |>
+              filter(p.adjust < 0.05)
+          }) |> 
+          bind_rows(.id = "cluster") |>
+          write_csv(file.path("output", paste0("KO_CTL_GO_", ont, "_results.csv")))
+          file.path("output", paste0("KO_CTL_GO_", ont, "_results.csv"))
+      }
+    )
+  ),
+
+  # KEGG
+  tar_target(
+    kegg_koctrl,
+    sapply(
+      efits_koctrl,
+      function(efit) {
+        limma::topTable(efit, number = Inf, p.value = 0.05) |>
+          filter(!symbol %in% prev_de$Symbol) |>
+          rownames() |>
+          my_enrichKEGG(key_type = "ensembl_gene_id")
+      }
+    )
+  ),
+  tar_target(
+    kegg_dotplot_koctrl,
+    format = "file",
+    kegg_koctrl |>
+      (\(keggs) {
+        pdf(file.path("output", "KO_CTL_KEGG_dotplot.pdf"), width = 10, height = 16)
+        for (i in names(keggs)) {
+          clusterProfiler::dotplot(keggs[[i]],
+            title = paste0("KO vs. CTL ", i, " KEGG enrichment")
+          ) |>
+            plot()
+        }
+        dev.off()
+        return(file.path("output", "KO_CTL_KEGG_dotplot.pdf"))
+      })()
+  ),
+  tar_target(
+    kegg_koctrl_results,
+    format = "file",
+    {
+      kegg_koctrl |>
+        lapply(function(x) {
+          x@result |>
+            filter(p.adjust < 0.05)
+        }) |>
+        bind_rows(.id = "cluster") |>
+        write_csv(file.path("output", "KO_CTL_KEGG_results.csv")
+        )
+      file.path("output", "KO_CTL_KEGG_results.csv")
+    }
   )
 )
