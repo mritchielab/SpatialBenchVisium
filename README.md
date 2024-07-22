@@ -1,6 +1,6 @@
-This repository contains code used to perform analysis and figures featured SpatialBench project.
-
 # SpatialBenchVisium
+
+This repository contains code used to perform analysis and figures featured in our paper:
 [**Spotlight on 10x Visium: a multi-sample protocol comparison of spatial technologies**](https://www.biorxiv.org/content/10.1101/2024.03.13.584910v1) 
 
 Mei R. M. Du, Changqing Wang, Charity W. Law, Daniela Amann-Zalcenstein, Casey J. A. Anttila, Ling Ling,
@@ -45,7 +45,3 @@ Simply navigate to the `targets_project` folder from the zenodo tarball `Spatial
 Figures 1-3, Supplementary figures S2-S7: `analysis/figures.R`
 
 Figure 4 & 5, Supplementary figures S8-S11: run `targets::tar_make()` in the `targets_project` folder, figures are saved to `targets_project/output`
-
-# Future datasets
-
-More datasets will be added to our benchmarking study and will be accessible through this repository, stay tuned!
